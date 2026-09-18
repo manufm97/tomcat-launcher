@@ -1,0 +1,1294 @@
+import * as path from "path";
+import * as fs from "fs";
+import { app, BrowserWindow, ipcMain, Menu, shell, dialog } from "electron";
+import { spawn, execSync } from "child_process";
+
+// La ubicacion de los scripts es la propia carpeta del launcher (auto contenida).
+const SCRIPT_DIR = __dirname;
+const ICON_PATH = path.join(__dirname, "app.ico");
+// Donde guardamos la ruta elegida por el usuario (persisente).
+const SETTINGS_PATH = path.join(app.getPath("userData"), "settings.json");
+
+let mainWindow: BrowserWindow | null = null;
+let runningProc: ReturnType<typeof spawn> | null = null;   // proceso powershell de start-app.ps1
+let tailTimer: NodeJS.Timeout | null = null;     // temporizador de tail de logs de Tomcat
+let isRunning = false;
+let appRunning = false;   // la app (Tomcat) esta activa -> bloquear Iniciar
+let startedProject: string | null = null; // proyecto que arranco esta app (para pararlo al cerrar)
+let modalTail: NodeJS.Timeout | null = null;     // tail del modal de logs
+let testProc: ReturnType<typeof spawn> | null = null; // proceso actual de tests
+let RESOURCES_PATH: string | null = null; // ruta base de proyectos elegida (persistente)
+
+// ---------- Persistencia de ruta base ----------
+function readResourcesPath(): string | null {
+  try {
+    const data = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8"));
+    if (data && data.resourcesPath && fs.existsSync(data.resourcesPath)) return data.resourcesPath;
+  } catch (e) {}
+  return null;
+}
+function saveResourcesPath(p: string): void {
+  try { fs.writeFileSync(SETTINGS_PATH, JSON.stringify({ resourcesPath: p }), "utf8"); } catch (e) {}
+}
+
+// Se pide la ruta solo UNA vez (la primera ejecucion). Devuelve true si hay ruta.
+async function ensureResourcesPath(): Promise<boolean> {
+  RESOURCES_PATH = readResourcesPath();
+  if (!RESOURCES_PATH) {
+    const res = await dialog.showOpenDialog(mainWindow!, {
+      title: "Elige la carpeta base de proyectos (resources)",
+      properties: ["openDirectory"],
+    });
+    if (res.canceled || !res.filePaths[0]) {
+      app.quit();
+      return false;
+    }
+    RESOURCES_PATH = res.filePaths[0];
+    saveResourcesPath(RESOURCES_PATH);
+  }
+  return true;
+}
+
+function sendConsole(text: string): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("console", String(text));
+  }
+}
+
+function sendStatus(text: string): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("status", String(text));
+  }
+}
+
+function sendTestProgress(payload: any): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("test-progress", JSON.stringify(payload));
+  }
+}
+
+// Avisa a la UI de si la app (Tomcat) esta activa, para habilitar/bloquear botones.
+function setAppRunning(state: boolean): void {
+  appRunning = state;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("running", state);
+  }
+}
+
+// Elimina codigos de escape ANSI para que el textarea quede limpio.
+function stripAnsi(str: string): string {
+  return str.replace(/\[[0-9;]*m/g, "");
+}
+
+function listProjects(): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(RESOURCES_PATH!, { withFileTypes: true });
+  } catch (e) {
+    return [];
+  }
+  const projects: string[] = [];
+  for (const e of entries) {
+    if (e.isDirectory()) {
+      const envPath = path.join(RESOURCES_PATH!, e.name, ".env");
+      if (fs.existsSync(envPath)) projects.push(e.name);
+    }
+  }
+  return projects;
+}
+
+interface EnvMap { [key: string]: string; }
+
+function parseEnv(name: string): EnvMap {
+  const envPath = path.join(RESOURCES_PATH!, name, ".env");
+  const out: EnvMap = {};
+  if (!fs.existsSync(envPath)) return out;
+  const text = fs.readFileSync(envPath, "utf8");
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const idx = line.indexOf("=");
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim();
+    let val = line.slice(idx + 1).trim();
+    val = val.replace(/^["']|["']$/g, "");
+    out[key] = val;
+  }
+  return out;
+}
+
+function getLogDir(name: string): string {
+  const env = parseEnv(name);
+  const tomcatHome = env.TOMCAT_HOME || "";
+  let catBase = env.CATALINA_BASE;
+  if (!catBase) catBase = path.join(tomcatHome, name);
+  return path.join(catBase, "logs");
+}
+
+// ---------- Tail de los logs de Tomcat ----------
+
+function stopTail(): void {
+  if (tailTimer) {
+    clearInterval(tailTimer);
+    tailTimer = null;
+  }
+}
+
+function startTail(name: string): void {
+  stopTail();
+  const logDir = getLogDir(name);
+  let lastFile: string | null = null;
+  let lastPos = 0;
+
+  tailTimer = setInterval(() => {
+    if (!fs.existsSync(logDir)) return;
+    let files: string[];
+    try {
+      files = fs.readdirSync(logDir).filter((f) => /\.log$/.test(f) && !/access_log/.test(f));
+    } catch (e) {
+      return;
+    }
+    if (files.length === 0) return;
+
+    // Elegir el fichero mas reciente por mtime (preferencia catalina*).
+    let best: string | null = null;
+    let bestMtime = -1;
+    let bestIsCatalina = false;
+    for (const f of files) {
+      const st = fs.statSync(path.join(logDir, f));
+      const isCat = /catalina/.test(f);
+      const better = (best === null) ||
+        (isCat !== bestIsCatalina ? isCat : st.mtimeMs > bestMtime);
+      if (better) {
+        best = f;
+        bestMtime = st.mtimeMs;
+        bestIsCatalina = isCat;
+      }
+    }
+    if (!best) return;
+
+    const full = path.join(logDir, best);
+    if (full !== lastFile) {
+      lastFile = full;
+      lastPos = fs.existsSync(full) ? fs.statSync(full).size : 0;
+    }
+    const st = fs.statSync(full);
+    if (st.size < lastPos) lastPos = 0; // fichero rotado
+    if (st.size > lastPos) {
+      try {
+        const fd = fs.openSync(full, "r");
+        const buf = Buffer.alloc(st.size - lastPos);
+        fs.readSync(fd, buf, 0, buf.length, lastPos);
+        fs.closeSync(fd);
+        lastPos = st.size;
+        sendConsole("[CATALINA] " + buf.toString("utf8"));
+      } catch (e) {
+        // ignora lecturas parciales
+      }
+    }
+  }, 1000);
+}
+
+// ---------- Arranque / parada ----------
+
+function startProject(name: string, debugPort?: string): void {
+  if (isRunning) {
+    sendStatus("Ya hay un arranque en curso.");
+    return;
+  }
+  isRunning = true;
+  startedProject = name;
+  setAppRunning(true);
+  sendStatus("Arrancando " + name + "...");
+  sendConsole("\n=== Iniciando " + name + " (" + new Date().toLocaleString() + ") ===\n");
+
+  const spawnArgs = ["-ExecutionPolicy", "Bypass", "-File", path.join(SCRIPT_DIR, "scripts", "start-app.ps1"), name];
+  if (debugPort) {
+    // Se pasa como argumento (no como variable de entorno) para que Maven/Node
+    // no lo hereden y el build sea identico al arranque normal.
+    spawnArgs.push(String(debugPort));
+    sendConsole("[DEBUG] Modo depuracion JDWP en el puerto " + debugPort + ". Conecta VS Code (Attach) a localhost:" + debugPort + "\n");
+  }
+
+  const ps = spawn("powershell.exe", spawnArgs, { windowsHide: false });
+  runningProc = ps;
+
+  ps.stdout.on("data", (d) => sendConsole(stripAnsi(d.toString())));
+  ps.stderr.on("data", (d) => sendConsole(stripAnsi(d.toString())));
+
+  ps.on("close", (code) => {
+    sendStatus("Script finalizado (codigo " + code + "). Tomcat sigue en segundo plano.");
+    sendConsole("\n=== scripts/start-app.ps1 finalizado (codigo " + code + ") ===\n");
+    runningProc = null;
+    isRunning = false;
+    // Tomcat queda activo en segundo plano: mantener Iniciar bloqueado.
+  });
+
+  ps.on("error", (err) => {
+    sendConsole("ERROR al lanzar el script: " + err.message + "\n");
+    isRunning = false;
+    runningProc = null;
+    setAppRunning(false);
+  });
+
+  // Espera a que Tomcat cree la carpeta de logs y empieza el tail.
+  setTimeout(() => startTail(name), 3000);
+}
+
+// Mata el arbol de procesos del arranque en curso (powershell + Maven/Tomcat),
+// para poder abortar en cualquier momento, incluso durante la compilacion.
+function killRunningTree(): void {
+  if (runningProc && runningProc.pid) {
+    try {
+      execSync("taskkill /T /F /PID " + runningProc.pid, { windowsHide: true, stdio: "ignore" });
+    } catch (e) {}
+    try { runningProc.kill(); } catch (e) {}
+    runningProc = null;
+    isRunning = false;
+  }
+}
+
+function stopProject(name: string): void {
+  sendStatus("Deteniendo " + name + "...");
+  sendConsole("\n=== Deteniendo " + name + " (" + new Date().toLocaleString() + ") ===\n");
+  // Si el arranque (p.ej. Maven) sigue en curso, lo abortamos primero.
+  killRunningTree();
+  setAppRunning(false);
+  const ps = spawn(
+    "powershell.exe",
+      ["-ExecutionPolicy", "Bypass", "-File", path.join(SCRIPT_DIR, "scripts", "stop-app.ps1"), name],
+    { windowsHide: false }
+  );
+  ps.stdout.on("data", (d) => sendConsole(stripAnsi(d.toString())));
+  ps.stderr.on("data", (d) => sendConsole(stripAnsi(d.toString())));
+  ps.on("close", () => {
+    sendStatus(name + " detenido.");
+    stopTail();
+    setAppRunning(false);
+    if (startedProject === name) startedProject = null;
+  });
+}
+
+// Detiene el Tomcat arrancado por esta app de forma desacoplada, para que
+// siga deteniendose aunque ya hayamos cerrado/quitado Electron.
+function stopRunningDetached(): void {
+  if (!startedProject) return;
+  const name = startedProject;
+  startedProject = null;
+  setAppRunning(false);
+  killRunningTree();
+  try {
+    const ps = spawn(
+      "powershell.exe",
+    ["-ExecutionPolicy", "Bypass", "-File", path.join(SCRIPT_DIR, "scripts", "stop-app.ps1"), name],
+      { windowsHide: true, detached: true, stdio: "ignore" }
+    );
+    ps.unref();
+    sendConsole("\n=== Cierre de la app: deteniendo " + name + " ===\n");
+  } catch (e) {
+    /* nada que hacer */
+  }
+}
+
+// ---------- Ventana ----------
+
+function createWindow(): void {
+  mainWindow = new BrowserWindow({
+    width: 1000,
+    height: 720,
+    icon: ICON_PATH,
+    frame: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  mainWindow.loadFile(path.join(__dirname, "index.html"));
+
+  // Ocultar el menu por defecto (File / Edit / View / ...) de Electron.
+  Menu.setApplicationMenu(null);
+
+  // Notifica al renderer cuando cambia el estado de maximizado, para
+  // alternar el icono de maximizar/restaurar (estilo Windows).
+  mainWindow.on("maximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("window-maximized", true);
+  });
+  mainWindow.on("unmaximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("window-maximized", false);
+  });
+
+  // Al intentar cerrar, detenemos Tomcat (si lo arranco esta app) y dejamos
+  // que la ventana se cierre; el proceso de parada sigue vivo de forma
+  // desacoplada gracias a stopRunningDetached().
+  mainWindow.on("close", () => {
+    stopRunningDetached();
+  });
+
+  mainWindow.on("closed", () => {
+    stopModalTail();
+    stopTail();
+    if (runningProc) {
+      try { runningProc.kill(); } catch (e) {}
+      runningProc = null;
+    }
+    mainWindow = null;
+  });
+}
+
+// ---------- IPC ----------
+
+ipcMain.handle("get-projects", () => listProjects());
+
+// Crea un proyecto nuevo: carpeta + .env generado desde docs/.env.ejemplo.
+ipcMain.handle("add-project", (event, payload) => {
+  const { name, javaHome, tomcatHome, dockerCompose, dockerWaitPort, startDocker } = payload || {};
+  if (!name || typeof name !== "string") return { ok: false, error: "Nombre vacío" };
+  const clean = name.trim();
+  if (!/^[\w.-]+$/.test(clean)) {
+    return { ok: false, error: "Nombre no válido (usa letras, números, ., _ o -)" };
+  }
+  const projectDir = path.join(RESOURCES_PATH!, clean);
+  const envPath = path.join(projectDir, ".env");
+  if (fs.existsSync(projectDir)) {
+    return { ok: false, error: "Ya existe un proyecto con ese nombre" };
+  }
+  const templatePath = path.join(__dirname, "docs", ".env.ejemplo");
+  if (!fs.existsSync(templatePath)) {
+    return { ok: false, error: "No se encuentra docs/.env.ejemplo" };
+  }
+  try {
+    const template = fs.readFileSync(templatePath, "utf8");
+    // Reemplaza los placeholders de la plantilla por el nombre real.
+    let envContent = template
+      .replace(/<nombre_proyecto>/g, clean)
+      .replace(/<NOMBRE>/g, clean.toUpperCase());
+    // Sobreescribe JAVA_HOME y TOMCAT_HOME si el usuario los proporcionó.
+    if (javaHome) {
+      envContent = envContent.replace(/^JAVA_HOME=.*$/m, "JAVA_HOME=" + javaHome);
+    }
+    if (tomcatHome) {
+      envContent = envContent.replace(/^TOMCAT_HOME=.*$/m, "TOMCAT_HOME=" + tomcatHome);
+    }
+    // Si el proyecto necesita servicios Docker se anade el compose al .env
+    // (acepta tambien la carpeta que lo contiene).
+    let composePath = dockerCompose ? String(dockerCompose).trim() : "";
+    if (composePath) {
+      const isDir = fs.existsSync(composePath) && fs.statSync(composePath).isDirectory();
+      if (isDir) {
+        const found = ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"]
+          .map((n) => path.join(composePath, n))
+          .find((p) => fs.existsSync(p));
+        if (!found) return { ok: false, error: "La carpeta no contiene ningun compose (docker-compose.yml)" };
+        composePath = found;
+      }
+      envContent = envContent.replace(/\s+$/, "") + "\r\n\r\n# --- Servicios Docker ---\r\nSTART_DOCKER=true";
+      envContent += "\r\nDOCKER_COMPOSE_FILE=" + composePath;
+      if (dockerWaitPort) envContent += "\r\nDOCKER_WAIT_PORT=" + String(dockerWaitPort).trim();
+      envContent += "\r\n";
+    }
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(envPath, envContent, "utf8");
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+  return { ok: true, name: clean };
+});
+
+// Escanea directorios comunes buscando instalaciones de Java.
+ipcMain.handle("scan-java", () => {
+  const bases = [
+    "C:\\Program Files\\Java",
+    "C:\\Program Files\\Eclipse Adoptium",
+    "C:\\Program Files\\Amazon Corretto",
+    "C:\\Program Files\\Microsoft",
+    "C:\\Program Files\\RedHat",
+    "C:\\Program Files\\Zulu",
+    "C:\\Program Files\\BellSoft",
+    "C:\\Program Files\\SapMachine",
+  ];
+  const results: { name: string; path: string; hasJava: boolean }[] = [];
+  for (const base of bases) {
+    if (!fs.existsSync(base)) continue;
+    try {
+      const dirs = fs.readdirSync(base, { withFileTypes: true });
+      for (const d of dirs) {
+        if (d.isDirectory()) {
+          const full = path.join(base, d.name);
+          const javaExe = path.join(full, "bin", "java.exe");
+          const hasJava = fs.existsSync(javaExe);
+          results.push({ name: d.name, path: full, hasJava });
+        }
+      }
+    } catch (e) {}
+  }
+  // Ordenar alfabéticamente por nombre
+  results.sort((a, b) => a.name.localeCompare(b.name));
+  return results;
+});
+
+// Escanea directorios comunes buscando instalaciones de Tomcat.
+ipcMain.handle("scan-tomcat", () => {
+  const base = "C:\\Program Files\\Apache Software Foundation";
+  const results: { name: string; path: string }[] = [];
+  if (!fs.existsSync(base)) return results;
+  try {
+    const dirs = fs.readdirSync(base, { withFileTypes: true });
+    for (const d of dirs) {
+      if (d.isDirectory() && d.name.toLowerCase().startsWith("tomcat")) {
+        const full = path.join(base, d.name);
+        results.push({ name: d.name, path: full });
+      }
+    }
+  } catch (e) {}
+  results.sort((a, b) => a.name.localeCompare(b.name));
+  return results;
+});
+
+// Devuelve la URL de la app y el PROJECT_DIR para el proyecto seleccionado.
+ipcMain.handle("get-app-url", (event, name: string) => {
+  const env = parseEnv(name);
+  const port = env.TOMCAT_PORT || "8080";
+  const ctx = env.CONTEXT_PATH || name;
+  const url = `http://localhost:${port}/${ctx}/`;
+  return {
+    url: url,
+    projectDir: env.PROJECT_DIR || "",
+  };
+});
+
+// Abre una URL en el navegador del sistema.
+ipcMain.on("open-url", (event, url: string) => {
+  try { shell.openExternal(url); } catch (e) {}
+});
+
+// --- Modal de logs de Tomcat ---
+function stopModalTail(): void {
+  if (modalTail) {
+    clearInterval(modalTail);
+    modalTail = null;
+  }
+}
+
+// Devuelve las dos ubicaciones de log del proyecto:
+//  - tomcat: <CATALINA_BASE>\logs  (catalina, localhost, ...)
+//  - app:    <APPS_LOG_PATH>\<proyecto>  (logs de la propia aplicacion)
+ipcMain.handle("get-logs-info", (event, name: string) => {
+  const env = parseEnv(name);
+  const tomcatHome = env.TOMCAT_HOME || "";
+  let catBase = env.CATALINA_BASE;
+  if (!catBase) catBase = path.join(tomcatHome, name);
+  const tomcatLogs = path.join(catBase, "logs");
+  const appsBase = env.APPS_BASE_PATH || "C:\\apps_env";
+  const appLogsDir = env.APPS_LOG_PATH || path.join(appsBase, "logs");
+  const appLogs = path.join(appLogsDir, name);
+  const listLogs = (dir: string): string[] => {
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .filter((f) => /\.log$/i.test(f) || /\.txt$/i.test(f))
+      .sort();
+  };
+  return {
+    tomcat: { dir: tomcatLogs, files: listLogs(tomcatLogs) },
+    app: { dir: appLogs, files: listLogs(appLogs) },
+  };
+});
+
+// Empieza a hacer tail de un fichero de log y envia los trozos nuevos al renderer.
+ipcMain.on("log-open", (event, payload) => {
+  stopModalTail();
+  const name = payload && payload.name;
+  const file = payload && payload.file;
+  const loc = payload && payload.loc;
+  if (!name || !file) return;
+  const env = parseEnv(name);
+  const tomcatHome = env.TOMCAT_HOME || "";
+  let catBase = env.CATALINA_BASE;
+  if (!catBase) catBase = path.join(tomcatHome, name);
+  const appsBase = env.APPS_BASE_PATH || "C:\\apps_env";
+  const appLogsDir = env.APPS_LOG_PATH || path.join(appsBase, "logs");
+  const full =
+    loc === "app"
+      ? path.join(appLogsDir, name, file)
+      : path.join(catBase, "logs", file);
+  let lastPos = 0;
+  if (fs.existsSync(full)) {
+    const size = fs.statSync(full).size;
+    // Envia el contenido existente (limitado a los ultimos 200 KB) al abrir.
+    const start = Math.max(0, size - 200000);
+    try {
+      const fd0 = fs.openSync(full, "r");
+      const buf0 = Buffer.alloc(size - start);
+      fs.readSync(fd0, buf0, 0, buf0.length, start);
+      fs.closeSync(fd0);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("log-chunk", buf0.toString("utf8"));
+      }
+    } catch (e) {}
+    lastPos = size;
+  }
+  modalTail = setInterval(() => {
+    if (!fs.existsSync(full)) return;
+    const st = fs.statSync(full);
+    if (st.size < lastPos) lastPos = 0;
+    if (st.size > lastPos) {
+      try {
+        const fd = fs.openSync(full, "r");
+        const buf = Buffer.alloc(st.size - lastPos);
+        fs.readSync(fd, buf, 0, buf.length, lastPos);
+        fs.closeSync(fd);
+        lastPos = st.size;
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("log-chunk", buf.toString("utf8"));
+        }
+      } catch (e) {}
+    }
+  }, 1000);
+});
+
+ipcMain.on("log-close", () => stopModalTail());
+
+// --- Modal de configuracion (.env) ---
+interface ConfigMeta {
+  description: string;
+  kind: "path" | "string" | "bool";
+  required: boolean;
+  common: boolean;
+  db?: "property" | "registry";
+  group?: "docker";
+}
+
+const CONFIG_CATALOG: Record<string, ConfigMeta> = {
+  CONTEXT_PATH: { description: "Contexto de despliegue de la aplicación", kind: "string", required: true, common: true },
+  PROJECT_DIR: { description: "Ruta del proyecto fuente", kind: "path", required: true, common: true },
+  WAR_MODULE_DIR: { description: "Nombre del módulo WAR del proyecto", kind: "string", required: true, common: true },
+  APPS_ENV: { description: "Entorno de despliegue", kind: "string", required: true, common: true },
+  APPS_BASE_PATH: { description: "Ruta base para instalaciones de entornos", kind: "path", required: true, common: true },
+  TOMCAT_HOME: { description: "Ruta de instalación de Tomcat", kind: "path", required: true, common: true },
+  TOMCAT_PORT: { description: "Puerto HTTP de Tomcat", kind: "string", required: true, common: true },
+  JAVA_HOME: { description: "Ruta del JDK a utilizar", kind: "path", required: true, common: true },
+  HEALTH_CHECK_URL: { description: "URL de comprobación de salud", kind: "string", required: false, common: true },
+  JNDI_NAME: { description: "Nombre del recurso JNDI de base de datos", kind: "string", required: false, common: true },
+  DB_URL_PROPERTY: { description: "Propiedad del fichero (URL)", kind: "string", required: false, common: true, db: "property" },
+  DB_URL_REGVAR: { description: "Variable de registro Windows (URL)", kind: "string", required: false, common: true, db: "registry" },
+  DB_USERNAME_PROPERTY: { description: "Propiedad del fichero (usuario)", kind: "string", required: false, common: true, db: "property" },
+  DB_USERNAME_REGVAR: { description: "Variable de registro Windows (usuario)", kind: "string", required: false, common: true, db: "registry" },
+  DB_PASSWORD_PROPERTY: { description: "Propiedad del fichero (contraseña)", kind: "string", required: false, common: true, db: "property" },
+  DB_PASSWORD_REGVAR: { description: "Variable de registro Windows (contraseña)", kind: "string", required: false, common: true, db: "registry" },
+  DEBUG_PORT: { description: "Puerto JDWP para depuración", kind: "string", required: false, common: true },
+  EXTRA_JVM_ARGS: { description: "Argumentos extra para la JVM", kind: "string", required: false, common: false },
+  ENCRYPT_KEY: { description: "Clave de cifrado para propiedades sensibles", kind: "string", required: false, common: false },
+  SKIP_BUILD: { description: "Omitir la construcción del WAR si ya existe", kind: "bool", required: false, common: false },
+  TEST_DIR: { description: "Ruta personalizada del directorio de tests", kind: "path", required: false, common: false },
+  START_DOCKER: { description: "Arrancar servicios Docker", kind: "bool", required: false, common: false, group: "docker" },
+  DOCKER_COMPOSE_FILE: { description: "Fichero compose a arrancar (vacío: se detecta solo)", kind: "path", required: false, common: false, group: "docker" },
+  DOCKER_WAIT_PORT: { description: "Puerto que debe escuchar antes de arrancar Tomcat", kind: "string", required: false, common: false, group: "docker" },
+  DOCKER_HEALTH_URL: { description: "URL de salud de los servicios Docker", kind: "string", required: false, common: false, group: "docker" },
+  DOCKER_WAIT_TIMEOUT: { description: "Segundos de espera de los servicios Docker", kind: "string", required: false, common: false, group: "docker" },
+};
+
+function inferConfigMeta(key: string): ConfigMeta {
+  if (CONFIG_CATALOG[key]) return CONFIG_CATALOG[key];
+  const lower = key.toLowerCase();
+  const isBool = /^(skip|enable|use|disable|allow)_/.test(lower);
+  const isPath = /_(path|dir|home)$/.test(lower) || lower.includes("path") || lower.includes("dir") || lower.includes("home");
+  return { description: "", kind: isBool ? "bool" : isPath ? "path" : "string", required: false, common: false };
+}
+
+interface ConfigEntryRaw {
+  type: "kv" | "other";
+  key?: string;
+  value?: string;
+  text?: string;
+  description?: string;
+  kind?: "path" | "string" | "bool";
+  required?: boolean;
+  common?: boolean;
+  db?: "property" | "registry";
+  group?: "docker";
+}
+
+function getConfigEntries(name: string): ConfigEntryRaw[] {
+  const envPath = path.join(RESOURCES_PATH!, name, ".env");
+  const out: ConfigEntryRaw[] = [];
+  if (!fs.existsSync(envPath)) return out;
+  const text = fs.readFileSync(envPath, "utf8");
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#") || raw.indexOf("=") === -1) {
+      out.push({ type: "other", text: raw });
+      continue;
+    }
+    const idx = raw.indexOf("=");
+    const key = raw.slice(0, idx).trim();
+    const value = raw.slice(idx + 1);
+    if (key === "") {
+      out.push({ type: "other", text: raw });
+      continue;
+    }
+    const meta = inferConfigMeta(key);
+    out.push({ type: "kv", key: key, value: value, ...meta });
+  }
+  return out;
+}
+
+ipcMain.handle("get-config", (event, name: string) => {
+  return { path: path.join(RESOURCES_PATH!, name, ".env"), entries: getConfigEntries(name) };
+});
+
+ipcMain.handle("save-config", (event, payload) => {
+  const name = payload && payload.name;
+  const entries = payload && payload.entries;
+  if (!name || !Array.isArray(entries)) return { ok: false };
+  const envPath = path.join(RESOURCES_PATH!, name, ".env");
+  const lines: string[] = [];
+  for (const e of entries) {
+    if (e.type === "kv") {
+      if (!e.key || e.key.trim() === "") continue; // ignorar variables sin nombre
+      lines.push(e.key.trim() + "=" + (e.value !== undefined ? e.value : ""));
+    } else {
+      lines.push(e.text !== undefined ? e.text : "");
+    }
+  }
+  fs.writeFileSync(envPath, lines.join("\r\n") + "\r\n", "utf8");
+  return { ok: true };
+});
+
+ipcMain.on("start", (event, name: string) => startProject(name));
+ipcMain.on("debug", (event, name: string) => startDebug(name));
+ipcMain.on("stop", (event, name: string) => stopProject(name));
+
+function startDebug(name: string): void {
+  if (!name) return;
+  const env = parseEnv(name);
+  const port = env.DEBUG_PORT || "8000";
+  const projectDir = env.PROJECT_DIR;
+  if (projectDir) {
+    try {
+      const vscodeDir = path.join(projectDir, ".vscode");
+      const launchPath = path.join(vscodeDir, "launch.json");
+      if (!fs.existsSync(launchPath)) {
+        fs.mkdirSync(vscodeDir, { recursive: true });
+        const cfg = {
+          version: "0.2.0",
+          configurations: [
+            {
+              type: "java",
+              name: "Attach " + name + " (Tomcat " + port + ")",
+              request: "attach",
+              hostName: "localhost",
+              port: parseInt(port, 10),
+            },
+          ],
+        };
+        fs.writeFileSync(launchPath, JSON.stringify(cfg, null, 2), "utf8");
+      }
+    } catch (e) {}
+    try {
+      shell.openExternal("vscode://file/" + projectDir.replace(/\\/g, "/"));
+    } catch (e) {}
+  }
+  startProject(name, port);
+}
+
+// --- Explorador de pruebas ---
+interface TestNode {
+  id: string;
+  name: string;
+  type: "class" | "method";
+  status: "none" | "pass" | "fail" | "skip";
+  children?: TestNode[];
+  className?: string;
+  duration?: number;
+  error?: string;
+}
+
+function findJavaFiles(dir: string): string[] {
+  const out: string[] = [];
+  if (!fs.existsSync(dir)) return out;
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      out.push(...findJavaFiles(full));
+    } else if (e.isFile() && e.name.endsWith(".java")) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+function extractPackage(text: string): string {
+  const m = text.match(/package\s+([a-zA-Z0-9_.]+)\s*;/);
+  return m ? m[1] : "";
+}
+
+function extractExtends(text: string): string | null {
+  const m = text.match(/class\s+\w+\s+extends\s+([A-Za-z_]\w*)/);
+  return m ? m[1] : null;
+}
+
+function buildClassFileMap(projectDir: string): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  const skipDirs = new Set(["target", "node_modules", ".git", "dist", "build"]);
+  function scan(dir: string) {
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!skipDirs.has(e.name)) scan(full);
+      } else if (e.isFile() && e.name.endsWith(".java")) {
+        const simple = e.name.replace(".java", "");
+        const arr = map.get(simple) || [];
+        arr.push(full);
+        map.set(simple, arr);
+      }
+    }
+  }
+  scan(projectDir);
+  return map;
+}
+
+function resolveBaseClassFile(baseName: string, fileText: string, projectDir: string, classMap: Map<string, string[]>): string | null {
+  const importRegex = new RegExp(`import\\s+(?:static\\s+)?([A-Za-z_][\\w.]*\\.${baseName})\\s*;`);
+  const m = fileText.match(importRegex);
+  if (m) {
+    const full = m[1];
+    const relative = full.replace(/\./g, "\\") + ".java";
+    const candidates = [
+      path.join(projectDir, "src", "test", "java", relative),
+      path.join(projectDir, "src", "main", "java", relative),
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+  }
+
+  const pkg = extractPackage(fileText);
+  if (pkg) {
+    const candidates = [
+      path.join(projectDir, "src", "test", "java", pkg.replace(/\./g, "\\"), baseName + ".java"),
+      path.join(projectDir, "src", "main", "java", pkg.replace(/\./g, "\\"), baseName + ".java"),
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+  }
+
+  const files = classMap.get(baseName);
+  if (files && files.length > 0) return files[0];
+
+  return null;
+}
+
+function collectTestMethods(file: string, projectDir: string, classMap: Map<string, string[]>, visited: Set<string>): string[] {
+  if (visited.has(file)) return [];
+  visited.add(file);
+
+  const text = fs.readFileSync(file, "utf8");
+  const ownMethods = extractTestMethods(text);
+  const baseName = extractExtends(text);
+  if (!baseName) return ownMethods;
+
+  const baseFile = resolveBaseClassFile(baseName, text, projectDir, classMap);
+  if (!baseFile) return ownMethods;
+
+  const inherited = collectTestMethods(baseFile, projectDir, classMap, visited);
+  return [...new Set([...ownMethods, ...inherited])];
+}
+
+function extractTestMethods(text: string): string[] {
+  const methods: string[] = [];
+  const lines = text.split(/\r?\n/);
+  const testAnnotationRegex = /@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|org\.junit\.jupiter\.api\.(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)|org\.junit\.Test|org\.testng\.annotations\.Test)\b/;
+  const methodSignatureRegex = /^(?:public|protected|private)?\s*(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?[\w<>\[\],\s.]+?\s+(\w+)\s*(?:\(|$)/;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const code = line.replace(/\/\/.*$/, "").trim();
+    if (!testAnnotationRegex.test(code)) continue;
+    let inBlockComment = false;
+    let signatureStarted = false;
+    for (let j = i + 1; j < lines.length; j++) {
+      let next = lines[j].trim();
+      if (!next) continue;
+      if (inBlockComment) {
+        if (next.includes("*/")) inBlockComment = false;
+        continue;
+      }
+      while (next.startsWith("/*")) {
+        const endIdx = next.indexOf("*/");
+        if (endIdx === -1) {
+          inBlockComment = true;
+          next = "";
+        } else {
+          next = next.substring(endIdx + 2).trim();
+        }
+        if (!next) break;
+      }
+      if (!next) continue;
+      if (inBlockComment) {
+        if (next.includes("*/")) inBlockComment = false;
+        continue;
+      }
+      if (next.startsWith("//")) continue;
+      if (!signatureStarted && next.startsWith("@")) continue;
+      const methodMatch = next.match(methodSignatureRegex);
+      if (methodMatch) {
+        methods.push(methodMatch[1]);
+      }
+      break;
+    }
+  }
+  return methods;
+}
+
+function getTestDir(name: string): string {
+  const env = parseEnv(name);
+  const projectDir = env.PROJECT_DIR;
+  if (!projectDir) return "";
+  if (env.TEST_DIR) return env.TEST_DIR;
+  const warName = env.WAR_MODULE_DIR || (path.basename(projectDir) + "-war");
+  return path.join(projectDir, warName, "src", "test");
+}
+
+function findAllTestDirs(projectDir: string): string[] {
+  const dirs: string[] = [];
+  const skipDirs = new Set(["target", "node_modules", ".git", "dist", "build"]);
+  function scan(dir: string) {
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (skipDirs.has(e.name)) continue;
+      const full = path.join(dir, e.name);
+      if (e.name === "test" && path.basename(dir) === "src") {
+        dirs.push(full);
+      } else {
+        scan(full);
+      }
+    }
+  }
+  scan(projectDir);
+  return dirs;
+}
+
+function discoverTests(name: string): TestNode[] {
+  const env = parseEnv(name);
+  const projectDir = env.PROJECT_DIR;
+  if (!projectDir) return [];
+
+  const testDirs = env.TEST_DIR ? [env.TEST_DIR] : findAllTestDirs(projectDir);
+  const root: TestNode[] = [];
+  const debug: { file: string; className: string; methods: string[] }[] = [];
+
+  for (const testDir of testDirs) {
+    if (!fs.existsSync(testDir)) continue;
+    const files = findJavaFiles(testDir);
+
+    for (const file of files) {
+      const text = fs.readFileSync(file, "utf8");
+      const methods = extractTestMethods(text);
+      const pkg = extractPackage(text);
+      const fileName = path.basename(file, ".java");
+      const className = pkg ? `${pkg}.${fileName}` : fileName;
+      debug.push({ file, className, methods: [...methods] });
+      if (methods.length === 0) continue;
+
+      const children: TestNode[] = methods
+        .sort((a, b) => a.localeCompare(b))
+        .map((m) => ({
+          id: `${className}#${m}`,
+          name: m,
+          type: "method",
+          status: "none",
+          className,
+        }));
+
+      root.push({
+        id: className,
+        name: fileName,
+        type: "class",
+        status: "none",
+        className,
+        children,
+      });
+    }
+  }
+
+  try {
+    const debugPath = path.join(projectDir, ".test-discovery-debug.json");
+    const allTestIds = root
+      .flatMap((c) => (c.children || []).map((m) => `${c.className}#${m.name}`))
+      .sort();
+    fs.writeFileSync(
+      debugPath,
+      JSON.stringify(
+        {
+          projectDir,
+          testDirs,
+          totalClasses: root.length,
+          totalMethods: allTestIds.length,
+          allTestIds,
+          files: debug.sort((a, b) => a.className.localeCompare(b.className)),
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+    sendConsole(`[TEST-DISCOVER] Debug escrito en: ${debugPath}\n`);
+  } catch (e) {}
+
+  return root.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function findSurefireReports(projectDir: string, depth = 3): string[] {
+  const out: string[] = [];
+  if (!projectDir || !fs.existsSync(projectDir) || depth <= 0) return out;
+
+  function scan(dir: string, level: number): void {
+    if (level <= 0 || !fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const full = path.join(dir, e.name);
+      if (e.name === "surefire-reports") {
+        const files = fs.readdirSync(full)
+          .filter((f) => f.startsWith("TEST-") && f.endsWith(".xml"))
+          .map((f) => path.join(full, f));
+        sendConsole(`[SUREFIRE-SCAN] ${full} -> ${files.length} archivos\n`);
+        out.push(...files);
+      } else if (e.name !== "node_modules") {
+        scan(full, level - 1);
+      }
+    }
+  }
+
+  scan(projectDir, depth);
+  return out;
+}
+
+function parseTestCaseAttrs(attrs: string): { name: string; classname: string; duration: number } | null {
+  const nameMatch = attrs.match(/\sname="([^"]+)"/);
+  const classMatch = attrs.match(/\sclassname="([^"]+)"/);
+  const timeMatch = attrs.match(/\stime="([^"]+)"/);
+  if (!nameMatch) return null;
+  return {
+    name: nameMatch[1],
+    classname: classMatch ? classMatch[1] : "",
+    duration: timeMatch ? parseFloat(timeMatch[1]) : 0,
+  };
+}
+
+function parseTestCaseBlock(block: string): { status: TestNode["status"]; duration: number; error: string } {
+  const timeMatch = block.match(/\stime="([^"]+)"/);
+  const time = timeMatch ? parseFloat(timeMatch[1]) : 0;
+  let status: TestNode["status"] = "pass";
+  let error = "";
+  if (block.includes("<failure")) { status = "fail"; error = extractXmlContent(block, "failure"); }
+  else if (block.includes("<error")) { status = "fail"; error = extractXmlContent(block, "error"); }
+  else if (block.includes("<skipped")) { status = "skip"; }
+  return { status, duration: Math.round(time * 1000), error };
+}
+
+function parseSurefireXml(text: string): { className: string; results: { id: string; method: string; status: TestNode["status"]; duration: number; error: string }[] } | null {
+  const classMatch = text.match(/<testsuite[^>]*\sname="([^"]+)"/);
+  const className = classMatch ? classMatch[1] : "";
+  if (!className) return null;
+
+  const results: { id: string; method: string; status: TestNode["status"]; duration: number; error: string }[] = [];
+
+  // testcase self-closing: <testcase ... />
+  const selfClosingRegex = /<testcase([^>]+)\/>/g;
+  let m;
+  while ((m = selfClosingRegex.exec(text)) !== null) {
+    const attrs = parseTestCaseAttrs(m[1]);
+    if (!attrs) continue;
+    const meta = parseTestCaseBlock(m[0]);
+    results.push({ id: `${attrs.classname || className}#${attrs.name}`, method: attrs.name, ...meta });
+  }
+
+  // testcase con contenido: <testcase ...>...</testcase>
+  const blockRegex = /<testcase([^>]+)>[\s\S]*?<\/testcase>/g;
+  while ((m = blockRegex.exec(text)) !== null) {
+    const attrs = parseTestCaseAttrs(m[1]);
+    if (!attrs) continue;
+    const meta = parseTestCaseBlock(m[0]);
+    results.push({ id: `${attrs.classname || className}#${attrs.name}`, method: attrs.name, ...meta });
+  }
+
+  return { className, results };
+}
+
+function parseSurefireReports(projectDir: string): Map<string, Partial<TestNode>> {
+  const map = new Map<string, Partial<TestNode>>();
+  const files = findSurefireReports(projectDir);
+  sendConsole(`[SUREFIRE-PARSE] ${files.length} archivos XML encontrados\n`);
+  if (files.length === 0) return map;
+
+  for (const file of files) {
+    sendConsole(`[SUREFIRE-PARSE] Leyendo ${path.basename(file)}\n`);
+    const text = fs.readFileSync(file, "utf8");
+    const parsed = parseSurefireXml(text);
+    if (!parsed) {
+      sendConsole(`[SUREFIRE-PARSE] No se pudo parsear ${path.basename(file)}\n`);
+      continue;
+    }
+    sendConsole(`[SUREFIRE-PARSE] ${parsed.results.length} resultados en ${parsed.className}\n`);
+    for (const r of parsed.results) {
+      map.set(r.id, { status: r.status, duration: r.duration, error: r.error });
+    }
+  }
+  return map;
+}
+
+function extractXmlContent(block: string, tag: string): string {
+  const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`);
+  const m = block.match(regex);
+  return m ? m[1].replace(/<\/?[^>]+>/g, " ").trim() : "";
+}
+
+function aggregateClassStatus(node: TestNode): void {
+  if (!node.children || node.children.length === 0) return;
+  for (const child of node.children) aggregateClassStatus(child);
+  if (node.children.some((c) => c.status === "fail")) node.status = "fail";
+  else if (node.children.some((c) => c.status === "skip")) node.status = "skip";
+  else if (node.children.every((c) => c.status === "pass")) node.status = "pass";
+  else node.status = "none";
+}
+
+ipcMain.handle("discover-tests", (event, name: string) => {
+  const tests = discoverTests(name);
+  const env = parseEnv(name);
+  let resultCount = 0;
+  let appliedCount = 0;
+  if (env.PROJECT_DIR) {
+    const results = parseSurefireReports(env.PROJECT_DIR);
+    resultCount = results.size;
+    for (const cls of tests) {
+      for (const method of cls.children || []) {
+        const res = results.get(method.id);
+        if (res) {
+          method.status = res.status || "none";
+          method.duration = res.duration;
+          method.error = res.error;
+          appliedCount++;
+        }
+      }
+      aggregateClassStatus(cls);
+    }
+  }
+  const methodCount = tests.reduce((sum, cls) => sum + (cls.children ? cls.children.length : 0), 0);
+  sendConsole(`[TEST-DISCOVER] ${tests.length} clases, ${methodCount} metodos, ${resultCount} resultados surefire, ${appliedCount} aplicados\n`);
+  return { tests, testDir: getTestDir(name) };
+});
+
+ipcMain.handle("set-test-dir", (event, payload: { name: string; dir: string }) => {
+  const name = payload && payload.name;
+  const dir = payload && payload.dir;
+  if (!name) return;
+  const envPath = path.join(RESOURCES_PATH!, name, ".env");
+  if (!fs.existsSync(envPath)) return;
+  let text = fs.readFileSync(envPath, "utf8");
+  const line = `TEST_DIR=${dir}`;
+  if (/^TEST_DIR=/m.test(text)) {
+    text = text.replace(/^TEST_DIR=.*$/m, line);
+  } else {
+    text = text.trimEnd() + "\r\n" + line + "\r\n";
+  }
+  fs.writeFileSync(envPath, text, "utf8");
+});
+
+ipcMain.handle("run-tests", async (event, payload: { name: string; ids: string[]; all?: boolean }) => {
+  const { name, ids, all } = payload;
+  const env = parseEnv(name);
+  const projectDir = env.PROJECT_DIR;
+  if (!projectDir || !fs.existsSync(projectDir)) return { ok: false, error: "Proyecto no encontrado" };
+
+  const pomPath = path.join(projectDir, "pom.xml");
+
+  let testArg = "";
+  if (all || ids.length === 0) {
+    sendConsole(`\n=== Ejecutando todos los tests ===\n`);
+  } else {
+    const selectors = ids.filter((id) => id.includes("#"));
+    testArg = selectors.join(",");
+    sendConsole(`\n=== Ejecutando ${selectors.length} tests ===\n`);
+  }
+
+
+  return new Promise<{ ok: boolean; error?: string }>((resolve) => {
+    if (testProc) {
+      try { testProc.kill(); } catch (e) {}
+    }
+    const testFilter = testArg ? `'-Dtest=${testArg}' ` : "";
+    const ps = spawn(
+      "powershell.exe",
+      [
+        "-ExecutionPolicy", "Bypass",
+        "-Command",
+        `& mvn test ${testFilter}'-DfailIfNoTests=false' -f '${pomPath}'`,
+      ],
+      { windowsHide: false, cwd: projectDir }
+    );
+    testProc = ps;
+
+    let currentClass = "";
+    let outputBuffer = "";
+
+    function processLine(line: string): void {
+      const runningMatch = line.match(/Running ([\w.]+Test)\s*$/);
+      if (runningMatch) {
+        currentClass = runningMatch[1];
+        sendConsole(`[TEST-STARTED] ${currentClass}\n`);
+        sendTestProgress({ type: "started", className: currentClass });
+        return;
+      }
+      const resultMatch = line.match(/Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)/);
+      if (resultMatch && currentClass) {
+        const [_, run, failures, errors, skipped] = resultMatch.map(Number);
+        let status: TestNode["status"] = "pass";
+        if (failures > 0 || errors > 0) status = "fail";
+        else if (skipped > 0 && run === skipped) status = "skip";
+
+        const results: { id: string; status: TestNode["status"]; duration?: number; error?: string }[] = [];
+        const reportFiles = findSurefireReports(projectDir);
+        const reportFile = reportFiles.find((f) => f.endsWith(`TEST-${currentClass}.xml`));
+        if (reportFile) {
+          try {
+            const text = fs.readFileSync(reportFile, "utf8");
+            const parsed = parseSurefireXml(text);
+            if (parsed) {
+              for (const r of parsed.results) {
+                results.push({ id: r.id, status: r.status, duration: r.duration, error: r.error });
+              }
+            }
+          } catch (e) {}
+        }
+
+        sendConsole(`[TEST-FINISHED] ${currentClass} -> ${status}\n`);
+        sendTestProgress({ type: "finished", className: currentClass, run, failures, errors, skipped, status, results });
+        currentClass = "";
+      }
+    }
+
+    function parseTestOutput(text: string): void {
+      outputBuffer += text;
+      const lines = outputBuffer.split(/\r?\n/);
+      outputBuffer = lines.pop() || "";
+      for (const line of lines) {
+        processLine(line.trim());
+      }
+    }
+
+    ps.stdout.on("data", (d) => {
+      const text = stripAnsi(d.toString());
+      sendConsole(text);
+      parseTestOutput(text);
+    });
+    ps.stderr.on("data", (d) => {
+      const text = stripAnsi(d.toString());
+      sendConsole(text);
+      parseTestOutput(text);
+    });
+
+    ps.on("close", (code) => {
+      testProc = null;
+      sendConsole(`\n=== Tests finalizados (código ${code}) ===\n`);
+      sendTestProgress({ type: "done" });
+    });
+
+    ps.on("error", (err) => {
+      testProc = null;
+      sendConsole("ERROR al ejecutar tests: " + err.message + "\n");
+      sendTestProgress({ type: "done", error: err.message });
+    });
+
+    resolve({ ok: true });
+  });
+});
+
+ipcMain.on("stop-tests", () => {
+  if (testProc && testProc.pid) {
+    try {
+      execSync("taskkill /T /F /PID " + testProc.pid, { windowsHide: true, stdio: "ignore" });
+    } catch (e) {}
+    try { testProc.kill(); } catch (e) {}
+    testProc = null;
+    sendConsole("\n=== Ejecución de tests detenida por el usuario ===\n");
+    sendTestProgress({ type: "done" });
+  }
+});
+
+// Explorador de archivos/carpetas para el editor de .env.
+ipcMain.handle("browse-path", async (event, currentPath: string) => {
+  const defaultPath = currentPath || RESOURCES_PATH || "";
+  const isDir = !path.extname(defaultPath);
+  const properties = isDir ? ["openDirectory"] : ["openFile"];
+  const defaultFilters = isDir ? undefined : [{ name: "Todos", extensions: ["*"] }];
+  const res = await dialog.showOpenDialog(mainWindow!, {
+    title: "Seleccionar ruta",
+    defaultPath: defaultPath,
+    properties: properties as any,
+    filters: defaultFilters as any,
+  });
+  if (res.canceled || !res.filePaths[0]) return { canceled: true };
+  return { canceled: false, path: res.filePaths[0] };
+});
+
+// Dialogo para elegir un fichero (p.ej. el compose de Docker).
+ipcMain.handle("browse-file", async (event, opts) => {
+  const o = (opts || {}) as { currentPath?: string; title?: string; extensions?: string[] };
+  const exts = o.extensions && o.extensions.length ? o.extensions : ["*"];
+  const res = await dialog.showOpenDialog(mainWindow!, {
+    title: o.title || "Seleccionar fichero",
+    defaultPath: o.currentPath || RESOURCES_PATH || "",
+    properties: ["openFile"],
+    filters: [{ name: "Fichero", extensions: exts }],
+  });
+  if (res.canceled || !res.filePaths[0]) return { canceled: true };
+  return { canceled: false, path: res.filePaths[0] };
+});
+
+// IPC de ajuste: obtener la ruta actual y elegir otra carpeta base.
+ipcMain.handle("get-resources-path", () => RESOURCES_PATH);
+ipcMain.handle("choose-resources-path", async () => {
+  const res = await dialog.showOpenDialog(mainWindow!, {
+    title: "Elige la carpeta base de proyectos (resources)",
+    properties: ["openDirectory"],
+  });
+  if (res.canceled || !res.filePaths[0]) return { ok: false, path: RESOURCES_PATH };
+  RESOURCES_PATH = res.filePaths[0];
+  saveResourcesPath(RESOURCES_PATH);
+  return { ok: true, path: RESOURCES_PATH };
+});
+
+ipcMain.on("clear-console", () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("clear");
+  }
+});
+
+// Controles de ventana (la ventana es frameless, sin barra de titulo del sistema).
+ipcMain.on("window-minimize", () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize(); });
+ipcMain.on("window-toggle-maximize", () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMaximized()) mainWindow.unmaximize(); else mainWindow.maximize();
+  }
+});
+ipcMain.on("window-close", () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close(); });
+
+app.whenReady().then(async () => {
+  createWindow();
+  const ok = await ensureResourcesPath();
+  if (!ok) return;
+  // Enviamos un "invalidar lista" para que el renderer recargue con la ruta ya.
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("settings-updated");
+});
+
+app.on("window-all-closed", () => {
+  stopTail();
+  if (process.platform !== "darwin") app.quit();
+});

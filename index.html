@@ -1,0 +1,210 @@
+﻿<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline';" />
+  <title>Tomcat Launcher</title>
+  <link rel="stylesheet" href="assets/material-icons.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <div class="bar-main">
+      <div class="brand">
+        <img class="brand-icon" src="app.ico" alt="Tomcat" width="28" height="28" />
+      </div>
+      <div class="select-wrap">
+        <select id="projectSelect" class="project-select" aria-label="Proyecto"></select>
+      </div>
+      <a id="projDir" class="chip disabled" href="#" title="Abrir carpeta del proyecto"><span class="material-icons">folder_open</span><span class="chip-label">Carpeta</span></a>
+      <div class="btn-group">
+        <button id="startBtn" class="icon-btn" title="Iniciar" aria-label="Iniciar"><span class="material-icons">play_arrow</span></button>
+        <button id="debugBtn" class="icon-btn" title="Depurar (JDWP)" aria-label="Depurar" disabled><span class="material-icons">bug_report</span></button>
+        <button id="stopBtn" class="icon-btn" title="Detener" aria-label="Detener" disabled><span class="material-icons">stop</span></button>
+        <button id="appBtn" class="icon-btn" title="Abrir en navegador" aria-label="Abrir en navegador" disabled><span class="material-icons">language</span></button>
+        <button id="testsBtn" class="icon-btn" title="Explorador de pruebas" aria-label="Pruebas" disabled><span class="material-icons">science</span></button>
+        <button id="clearBtn" class="icon-btn" title="Limpiar consola" aria-label="Limpiar"><span class="material-icons">delete</span></button>
+      </div>
+      <span class="bar-spacer"></span>
+      <div class="btn-group">
+        <button id="logsBtn" class="icon-btn" title="Ver logs de Tomcat" aria-label="Ver logs" disabled><span class="material-icons">description</span></button>
+        <button id="cfgBtn" class="icon-btn" title="Configuración (.env)" aria-label="Configuración" disabled><span class="material-icons">tune</span></button>
+        <button id="vscodeBtn" class="icon-btn" title="Abrir en VS Code" aria-label="Abrir en VS Code" disabled><span class="material-icons">code</span></button>
+        <button id="pathBtn" class="icon-btn" title="Ruta base de proyectos" aria-label="Ruta base"><span class="material-icons">folder</span></button>
+         <button id="addProjectBtn" class="icon-btn" title="Añadir proyecto" aria-label="Añadir proyecto"><span class="material-icons">add</span></button>
+      </div>
+      <div class="status-chip">
+        <span class="status-dot"></span>
+        <span id="status">Cargando proyectos...</span>
+      </div>
+      <div class="window-controls">
+        <button id="winMin" class="icon-btn" title="Minimizar" aria-label="Minimizar">
+          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor"><path d="M0 5.5h11"/></svg>
+        </button>
+        <button id="winMax" class="icon-btn" title="Maximizar" aria-label="Maximizar">
+          <svg class="ic-max" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor"><path d="M0.5 0.5h9v9h-9z"/></svg>
+          <svg class="ic-restore" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor"><path d="M2.5 2.5v-2h7v7h-2M0.5 2.5h7v7h-7z"/></svg>
+        </button>
+        <button id="winClose" class="icon-btn" title="Cerrar" aria-label="Cerrar">
+          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor"><path d="M0.35 0.35l10.3 10.3M10.65 0.35L0.35 10.65"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+  <div id="console" class="logview"></div>
+
+  <div id="logModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span class="material-icons modal-icon">description</span>
+        <span id="logTitle" class="modal-title">Logs de Tomcat</span>
+        <button id="logClose" class="icon-btn" title="Cerrar" aria-label="Cerrar"><span class="material-icons">close</span></button>
+      </div>
+      <div class="modal-bar">
+        <select id="logFileSelect" aria-label="Fichero de log"></select>
+      </div>
+      <div id="logViewer" class="logview"></div>
+    </div>
+  </div>
+
+  <div id="configModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span class="material-icons modal-icon">tune</span>
+        <span id="configTitle" class="modal-title">Configuración (.env)</span>
+        <button id="configClose" class="icon-btn" title="Cerrar" aria-label="Cerrar"><span class="material-icons">close</span></button>
+      </div>
+      <div id="configRows" class="cfg-rows">
+        <p class="cfg-hint">Edita las variables. Los comentarios se conservan al guardar.</p>
+      </div>
+      <button class="cfg-add" id="configAdd"><span class="material-icons">add</span> Añadir variable</button>
+      <div class="modal-foot">
+        <button class="btn-text" id="configCancel">Cancelar</button>
+        <button class="btn-filled primary" id="configSave">Guardar</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="addVarModal" class="modal hidden">
+    <div class="modal-box np-box">
+      <div class="modal-head">
+        <span class="material-icons modal-icon">add_circle</span>
+        <span class="modal-title">Nueva variable</span>
+        <button id="addVarClose" class="icon-btn" title="Cerrar" aria-label="Cerrar"><span class="material-icons">close</span></button>
+      </div>
+      <div class="np-body">
+        <div class="np-select-wrap">
+          <select id="addVarKind" class="np-select" aria-label="Tipo">
+            <option value="string">Texto</option>
+            <option value="path">Ruta</option>
+            <option value="bool">Boolean (true/false)</option>
+          </select>
+          <span class="material-icons np-arrow">arrow_drop_down</span>
+        </div>
+        <input id="addVarKey" class="np-input" type="text" placeholder="Nombre de la variable" autocomplete="off" spellcheck="false" />
+        <div class="add-var-path-wrap">
+          <input id="addVarValue" class="np-input" type="text" placeholder="Valor" autocomplete="off" spellcheck="false" />
+          <button id="addVarBrowse" class="cfg-browse" title="Explorar ruta" type="button"><span class="material-icons">folder_open</span></button>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn-text" id="addVarCancel">Cancelar</button>
+        <button class="btn-filled primary" id="addVarConfirm">Añadir</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="newProjectModal" class="modal hidden">
+    <div class="modal-box np-box">
+      <div class="modal-head">
+        <span class="material-icons modal-icon">add_circle</span>
+        <span class="modal-title">Nuevo proyecto</span>
+        <button id="newProjectClose" class="icon-btn" title="Cerrar" aria-label="Cerrar"><span class="material-icons">close</span></button>
+      </div>
+      <div class="np-body">
+        <p class="cfg-hint">Se creará una carpeta con este nombre y su fichero .env a partir de la plantilla de docs/.env.ejemplo.</p>
+        <input id="newProjectName" class="np-input" type="text" placeholder="nombre_proyecto" autocomplete="off" spellcheck="false" />
+        <div class="np-select-wrap">
+          <select id="newProjectJava" class="np-select" aria-label="JAVA_HOME"></select>
+          <span class="material-icons np-arrow">arrow_drop_down</span>
+        </div>
+        <div class="np-select-wrap">
+          <select id="newProjectTomcat" class="np-select" aria-label="TOMCAT_HOME"></select>
+          <span class="material-icons np-arrow">arrow_drop_down</span>
+        </div>
+        <label class="np-check">
+          <input id="newProjectDocker" type="checkbox" />
+          <span>Requiere servicios Docker (docker compose)</span>
+        </label>
+        <div id="newProjectDockerFields" class="np-docker-fields hidden">
+          <div class="add-var-path-wrap">
+            <input id="newProjectDockerPath" class="np-input" type="text" placeholder="Ruta del docker-compose.yml" autocomplete="off" spellcheck="false" />
+            <button id="newProjectDockerBrowse" class="cfg-browse" title="Explorar fichero compose" type="button"><span class="material-icons">folder_open</span></button>
+          </div>
+          <input id="newProjectDockerPort" class="np-input" type="text" placeholder="Puerto a esperar (opcional, ej. 8888)" autocomplete="off" spellcheck="false" />
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn-text" id="newProjectCancel">Cancelar</button>
+        <button class="btn-filled primary" id="newProjectCreate">Crear</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="testsModal" class="modal hidden modal-no-dismiss">
+    <div class="modal-box tests-box">
+      <div class="modal-head">
+        <span class="material-icons modal-icon">science</span>
+        <span class="modal-title">Explorador de pruebas</span>
+        <button id="testsClose" class="icon-btn" title="Cerrar" aria-label="Cerrar"><span class="material-icons">close</span></button>
+      </div>
+      <div class="modal-bar tests-bar">
+        <button class="btn-text" id="testsRefresh"><span class="material-icons">refresh</span> Refrescar</button>
+        <button class="btn-filled primary" id="testsRunSelected"><span class="material-icons">play_arrow</span> Ejecutar seleccionados</button>
+        <button class="btn-text" id="testsRunAll"><span class="material-icons">playlist_play</span> Ejecutar todo</button>
+        <span class="bar-spacer"></span>
+        <button class="btn-text tests-stop" id="testsStop"><span class="material-icons">stop</span> Detener</button>
+      </div>
+      <div class="tests-dir-bar">
+        <span id="testsDirLabel" class="tests-dir-label">Ruta de tests</span>
+        <button class="btn-text" id="testsChangeDir"><span class="material-icons">folder_open</span> Cambiar ruta</button>
+      </div>
+      <div id="testsProgress" class="tests-progress hidden">
+        <span class="material-icons tests-spinner">sync</span>
+        <span id="testsProgressText">Ejecutando tests...</span>
+      </div>
+      <div class="tests-master-bar">
+        <label class="tests-master-label">
+          <input id="testsMasterCheck" type="checkbox" />
+          <span id="testsMasterLabel">Seleccionar todo</span>
+        </label>
+      </div>
+      <div id="testsSummary" class="tests-summary">
+        <span class="tests-summary-item test-pass" title="Pass"><span class="material-icons">check_circle</span> <b id="summaryPass">0</b></span>
+        <span class="tests-summary-item test-fail" title="Fail"><span class="material-icons">error</span> <b id="summaryFail">0</b></span>
+        <span class="tests-summary-item test-skip" title="Skip"><span class="material-icons">skip_next</span> <b id="summarySkip">0</b></span>
+        <span class="tests-summary-item test-none" title="No ejecutados"><span class="material-icons">radio_button_unchecked</span> <b id="summaryNone">0</b></span>
+      </div>
+      <div id="testsTree" class="tests-tree">
+        <p class="cfg-hint">Cargando tests...</p>
+      </div>
+      <div class="modal-foot">
+        <span id="testsStatus" class="tests-status">Selecciona los tests a ejecutar</span>
+        <button class="btn-text" id="testsCancel">Cerrar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="renderer/dom.js"></script>
+  <script src="renderer/utils.js"></script>
+  <script src="renderer/ui.js"></script>
+  <script src="renderer/console.js"></script>
+  <script src="renderer/logs.js"></script>
+  <script src="renderer/config.js"></script>
+  <script src="renderer/new-project.js"></script>
+  <script src="renderer/tests.js"></script>
+  <script src="renderer/window.js"></script>
+  <script src="renderer/ripple.js"></script>
+  <script src="renderer/main.js"></script>
+</body>
+</html>

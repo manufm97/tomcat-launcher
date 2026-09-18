@@ -1,0 +1,23 @@
+{
+  "name": "apps-env-launcher",
+  "version": "1.0.0",
+  "description": "Launcher Electron para arrancar proyectos Tomcat (scripts/start-app.ps1) con consola integrada.",
+  "main": "main.js",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "tsc": "tsc && tsc -p tsconfig.main.json",
+    "build": "npm run tsc && powershell -ExecutionPolicy Bypass -File scripts/build.ps1",
+    "dist": "npm run tsc && powershell -ExecutionPolicy Bypass -File scripts/build.ps1"
+  },
+  "devDependencies": {
+    "@material-design-icons/font": "^0.14.15",
+    "electron": "^31.0.0",
+    "electron-packager": "^17.1.2",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "png-to-ico": "^3.0.2"
+  }
+}
