@@ -1,154 +1,143 @@
-# Despliegue local - Proyectos
+# Tomcat Launcher
 
-Sistema escalable para compilar, desplegar y arrancar proyectos Java/Tomcat.
-Cada proyecto solo necesita un fichero `.env`.
-
-Replica el flujo de Eclipse WTP con **base Tomcat aislada por proyecto**:
-cada app corre en `<TOMCAT_HOME>\<proyecto>\` con sus propias carpetas
-`conf/`, `webapps/`, `logs/`, `temp/` y `work/` (creadas al primer arranque),
-todas escuchando en el puerto 8080 (una arrancada cada vez). La conexion a BD
-se define en el descriptor de contexto de la base y las rutas `APPS_*` se
-derivan automaticamente de `APPS_BASE_PATH`.
-
-Al arrancar por primera vez, el launcher (Electron) pide la carpeta base de
-proyectos (`resources`) con un dialogo y la guarda en
-`%APPDATA%\TomcatLauncher\settings.json`. Tambien puedes cambiarla desde el
-boton carpeta de la barra superior. Los scripts `scripts/start-app.ps1` y
-`scripts/stop-app.ps1` viven dentro de la propia carpeta `launcher\`, por lo que el
-launcher es auto contenido y facil de compartir.
-
-Al arrancar, `scripts/start-app.ps1` se encarga de todo el ciclo:
-
-1. Para el Tomcat si ya estaba corriendo
-2. Compila con Maven (`clean install -DskipTests`) — omítelo con `SKIP_BUILD=true` en el `.env`
-3. Copia la configuración de `<proyecto>-config` y `<proyecto>-resources` para el entorno indicado
-4. Arranca los servicios Docker si `START_DOCKER=true` y el proyecto tiene carpeta `docker/` (o `DOCKER_COMPOSE_FILE`)
-5. Desactiva las demás apps del mismo Tomcat (solo queda desplegada la solicitada)
-6. Configura puertos, contexto JNDI y despliega el WAR en `webapps`
-7. Arranca y espera respuesta del health check si hay `HEALTH_CHECK_URL`
-
-### Servicios Docker
-
-Algunas apps no funcionan sin su config
-server. Si el proyecto tiene un fichero compose se levanta automáticamente
-antes de Tomcat:
-
-- Solo arranca Docker si `START_DOCKER=true`.
-- Se busca en `resources\<proyecto>\docker\` y, después, en `PROJECT_DIR`
-  (`docker-compose.yml` / `docker-compose.yaml` / `compose.yml` / `compose.yaml`).
-- Desde el launcher: al crear el proyecto marca **Requiere servicios Docker** e
-  indica la ruta del compose (y opcionalmente el puerto a esperar); también se
-  ajusta después en el modal de configuración, sección **Servicios Docker**.
-- Las variables del `.env` (p.ej. `ENCRYPT_KEY`) se pasan al compose.
-
-## Uso (desde PowerShell dentro de `launcher`)
-
-```powershell
-# Arrancar
-.\scripts\start-app.ps1 app_1
-.\scripts\start-app.ps1 app_2
-.\scripts\start-app.ps1 app_3
-
-# Detener
-.\scripts\stop-app.ps1 app_1
-.\scripts\stop-app.ps1 app_2
-.\scripts\stop-app.ps1 app_3
-```
-
-Si no pasas parametro, muestra los proyectos disponibles de la carpeta base.
+Aplicación de escritorio basada en Electron para iniciar, gestionar y depurar proyectos Java basados en Tomcat, con consola integrada, configuración y detección de pruebas.
 
 ---
 
-## Como agregar un nuevo proyecto
+## Tabla de Contenidos
 
-### Desde el launcher (recomendado)
-
-Pulsa el boton **+** junto al selector de proyecto. Se abre un dialogo donde:
-
-1. Introduces el nombre del proyecto
-2. Seleccionas el JDK de Java del desplegable (escanea automaticamente `C:\Program Files\Java`, `Eclipse Adoptium`, `Amazon Corretto`, etc.)
-3. Seleccionas la version de Tomcat del desplegable (escanea `C:\Program Files\Apache Software Foundation`)
-4. El launcher crea la carpeta en `resources\<proyecto>` con el `.env` generado automaticamente a partir de `docs/.env.ejemplo`
-
-### Manualmente
-
-```powershell
-mkdir C:\apps_env\resources\<nuevo>
-Copy-Item .\docs\.env.ejemplo C:\apps_env\resources\<nuevo>\.env
-notepad C:\apps_env\resources\<nuevo>\.env
-```
-
-Editar como minimo:
-
-```ini
-PROJECT_DIR=C:\Git\<nuevo>
-WAR_MODULE_DIR=<nuevo>-war
-CONTEXT_PATH=<nuevo>
-TOMCAT_HOME=C:\Program Files\Apache Software Foundation\Tomcat 9.0
-JAVA_HOME=C:\Program Files\Java\jdk-11.0.21
-```
-
-### Variables de BD en el registro
-
-```powershell
-[Environment]::SetEnvironmentVariable("ORACLE_URL", "jdbc:oracle:thin:@...", "User")
-[Environment]::SetEnvironmentVariable("DB_USER_NUEVO", "USUARIO", "User")
-[Environment]::SetEnvironmentVariable("DB_PASS_NUEVO", "PASSWORD", "Pass")
-```
-
-### Arrancar
-
-```powershell
-.\scripts\start-app.ps1 <nuevo>
-```
-
-**No hay mas pasos.** El script lee todo del `.env`.
+1. [Inicio Rápido](#inicio-rápido)
+2. [Primeros Pasos](#primeros-pasos)
+3. [Uso de la Interfaz](#uso-de-la-interfaz)
+   - [Selector de Proyecto](#selector-de-proyecto)
+   - [Botones de Acción](#botones-de-acción)
+   - [Modals](#modals)
+4. [Añadir un Nuevo Proyecto](#añadir-un-nuevo-proyecto)
+5. [Configuración (.env)](#-configuración-env)
+6. [Soporte Docker](#-soporte-docker)
+7. [Explorador de Pruebas](#explorador-de-pruebas)
+8. [Despliegue desde PowerShell](#despliegue-desde-powershell)
+9. [Solución de Problemas](#solución-de-problemas)
+10. [Estructura de Archivos](#estructura-de-archivos)
 
 ---
 
-## Estructura
+## Inicio Rápido
 
-```
-C:\apps_env\resources\        # <- carpeta base que el launcher te pide
-│
-├── launcher\                 # <- auto contenido, listo para compartir
-│   ├── main.js / renderer.js / preload.js / index.html
-│   ├── scripts/
-│   │   ├── start-app.ps1     # Ciclo completo: build + config + deploy + arranque
-│   │   └── stop-app.ps1      # Parada generica (PowerShell)
-│   ├── docs/
-│   │   └── .env.ejemplo      # Template para nuevos proyectos
-│   └── ...
-│
-├── app_1/
-│   └── .env              # Java 21 + Tomcat 10.1
-├── app_2/
-│   └── .env              # Java 11 + Tomcat 9.0
-└── app_3/
-    └── .env              # Java 11 + Tomcat 9.0
-```
+```powershell
+# 1. Ejecuta la aplicación
+npm start
 
-Nota: cada proyecto es una carpeta de la base con un fichero `.env` en su raiz.
+# 2. Selecciona la carpeta base de proyectos (solo la primera vez)
+#    - Pulsa el botón "Ruta base" en la barra superior
+#    - O ejecuta: .\scripts\start-app.ps1 y sigue el diálogo
+
+# 3. Añade un proyecto nuevo usando el botón + en la interfaz
+#    - O crea la carpeta manualmente y ejecuta: .\scripts\start-app.ps1 <nombre>
+```
 
 ---
 
-## Variables .env
+## Primeros Pasos
 
-### Obligatorias
+### 1. Ejecutar la Aplicación
 
-| Variable           | Descripcion                               | Ejemplo                                                    |
-| ------------------ | ----------------------------------------- | ---------------------------------------------------------- |
-| `PROJECT_DIR`    | Raiz del proyecto Maven                   | `C:\Git\mi_app`                                          |
-| `WAR_MODULE_DIR` | Nombre del modulo WAR (sin ruta completa) | `mi_app-war`                                             |
-| `CONTEXT_PATH`   | Context path de la app                    | `mi_app`                                                 |
-| `TOMCAT_HOME`    | Instalacion de Tomcat                     | `C:\Program Files\Apache Software Foundation\Tomcat 9.0` |
-| `JAVA_HOME`      | Directorio del JDK                        | `C:\Program Files\Java\jdk-11.0.21`                      |
+```powershell
+npm start
+```
 
-### Base de datos
+Al iniciar, la aplicación pedirá que seleccione la **carpeta base de proyectos** (directorio `resources`). Esta elección se guarda persistentemente en `%APPDATA%\TomcatLauncher\settings.json`.
 
-Las passwords NO van en el `.env`. Se leen del registro via `*_REGVAR`:
+### 2. Elección de la Carpeta Base
 
-| Variable                 | Descripcion                                      |
+- Pulsa el botón **Ruta base** (folder icon) en la barra superior
+- O selecciona "Elegir ruta base de proyectos" desde el menú
+- La carpeta debe contener subcarpetas de proyectos con ficheros `.env`
+
+---
+
+## Uso de la Interfaz
+
+### Selector de Proyecto
+
+La aplicación muestra una lista de proyectos detectados en la carpeta base. Cada proyecto debe tener un fichero `.env` en su raíz con las variables obligatorias (ver sección de Variables `.env`).
+
+### Botones de Acción
+
+| Botón                          | Atajo            | Descripción                                                 |
+| ------------------------------- | ---------------- | ------------------------------------------------------------ |
+| **Iniciar**               | `Ctrl+R`       | Arranca el proyecto seleccionado en Tomcat                   |
+| **Depurar**               | `Ctrl+D`       | Arranca con depuración JDWP (VS Code attach)                |
+| **Detener**               | `Ctrl+S`       | Detiene el Tomcat en ejecución                              |
+| **Abrir en navegador**    | `Ctrl+L`       | Abre la URL de la aplicación en el navegador predeterminado |
+| **Explorador de pruebas** | `Ctrl+T`       | Abre el analizador de tests JUnit/TestNG                     |
+| **Limpiar consola**       | `Ctrl+K`       | Borra la consola inferior                                    |
+| **Ver logs**              | `Ctrl+Shift+L` | Abre el visor de logs de Tomcat                              |
+| **Configuración**        | `Ctrl+Shift+C` | Edita el fichero`.env` del proyecto                        |
+| **Abrir en VS Code**      | `Ctrl+Shift+V` | Abre el proyecto en VS Code                                  |
+| **Ruta base**             | `Ctrl+Shift+P` | Cambia la carpeta base de proyectos                          |
+| **Añadir proyecto**      | `Ctrl+Shift+N` | Crea un nuevo proyecto desde la plantilla                    |
+
+### Modals
+
+- **Nuevo Proyecto**: Crear un proyecto nuevo usando la plantilla `docs/.env.ejemplo`
+- **Configuración (.env)**: Editar todas las variables de configuración
+- **Logs de Tomcat**: Ver y seguir los logs en tiempo real
+- **Explorador de pruebas**: Descubrir y ejecutar tests unitarios
+
+---
+
+## Añadir un Nuevo Proyecto
+
+### Desde la Interfaz (Recomendado)
+
+1. Pulsa el botón **+** (Añadir proyecto) en la barra superior
+2. Introduce el nombre del proyecto (solo letras, números, `_`, `-`, `.`)
+3. Selecciona el **JAVA_HOME** del desplegable (o escribe una ruta personalizada)
+4. Selecciona el **TOMCAT_HOME** del desplegable (o escribe una ruta personalizada)
+5. Marca/desmarca **"Requiere servicios Docker"** si es necesario
+6. Si hay Docker, indica la ruta del fichero `docker-compose.yml` (opcional) y el puerto a esperar (opcional)
+7. Pulsa **Crear**
+
+La aplicación creará automáticamente:
+
+- `resources\<nombre_proyecto>\` carpeta
+- `resources\<nombre_proyecto>\.env` configurado con los valores proporcionados
+
+### Desde PowerShell
+
+```powershell
+# 1. Copia la plantilla
+Copy-Item docs\.env.ejemplo resources\nuevo-proyecto\.env
+
+# 2. Edita el .env (mínimo obligatorio)
+notepad resources\nuevo-proyecto\.env
+
+# 3. Arranca
+.\scripts\start-app.ps1 nuevo-proyecto
+```
+
+---
+
+## Configuración (.env)
+
+Cada proyecto tiene un fichero `.env` en su raíz con las siguientes variables:
+
+### Variables Obligatorias
+
+| Variable           | Descripción                               | Ejemplo                                                    |
+| ------------------ | ------------------------------------------ | ---------------------------------------------------------- |
+| `PROJECT_DIR`    | Raíz del proyecto Maven                   | `C:\Git\mi_app`                                          |
+| `WAR_MODULE_DIR` | Nombre del módulo WAR (sin ruta completa) | `mi_app-war`                                             |
+| `CONTEXT_PATH`   | Context path de la app                     | `mi_app`                                                 |
+| `TOMCAT_HOME`    | Instalación de Tomcat                     | `C:\Program Files\Apache Software Foundation\Tomcat 9.0` |
+| `JAVA_HOME`      | Directorio del JDK                         | `C:\Program Files\Java\jdk-11.0.21`                      |
+
+### Variables de Base de Datos (Registro Windows)
+
+Las passwords **no** van en el `.env`. Se leen del registro mediante `*_REGVAR`:
+
+| Variable                 | Descripción                                     |
 | ------------------------ | ------------------------------------------------ |
 | `DB_URL_PROPERTY`      | Nombre de la propiedad Java                      |
 | `DB_URL_REGVAR`        | Variable de entorno del registro con la URL      |
@@ -157,40 +146,242 @@ Las passwords NO van en el `.env`. Se leen del registro via `*_REGVAR`:
 | `DB_PASSWORD_PROPERTY` | Nombre de la propiedad Java                      |
 | `DB_PASSWORD_REGVAR`   | Variable de entorno del registro con la password |
 
-### Opcionales (tienen default)
+### Variables Opcionales (con Defaults)
 
-| Variable                 | Default                               |
-| ------------------------ | ------------------------------------- |
-| `TOMCAT_PORT`          | `8080`                              |
-| `TOMCAT_SHUTDOWN_PORT` | `8005`                              |
-| `APPS_BASE_PATH`       | `C:\apps_env`                       |
-| `APPS_CONFIG_PATH`     | `<APPS_BASE_PATH>\config`           |
-| `APPS_LOG_PATH`        | `<APPS_BASE_PATH>\logs`             |
-| `APPS_DATA_PATH`       | `<APPS_BASE_PATH>\data`             |
-| `APPS_TEMP_PATH`       | `<APPS_BASE_PATH>\temp`             |
-| `APPS_RESOURCE_PATH`   | `<APPS_BASE_PATH>\resources`        |
-| `CATALINA_BASE`        | `<TOMCAT_HOME>\<proyecto>`          |
-| `START_DOCKER`         | `false` (Boolean)                   |
-| `DOCKER_COMPOSE_FILE`  | auto: carpeta`docker/` del proyecto |
-| `DOCKER_WAIT_PORT`     | (ninguno: no espera)                  |
-| `DOCKER_HEALTH_URL`    | (ninguno: no comprueba)               |
-| `DOCKER_WAIT_TIMEOUT`  | `90` (segundos)                     |
+| Variable                 | Default                        |
+| ------------------------ | ------------------------------ |
+| `TOMCAT_PORT`          | `8080`                       |
+| `TOMCAT_SHUTDOWN_PORT` | `8005`                       |
+| `APPS_BASE_PATH`       | `C:\apps_env`                |
+| `APPS_CONFIG_PATH`     | `<APPS_BASE_PATH>\config`    |
+| `APPS_LOG_PATH`        | `<APPS_BASE_PATH>\logs`      |
+| `APPS_DATA_PATH`       | `<APPS_BASE_PATH>\data`      |
+| `APPS_TEMP_PATH`       | `<APPS_BASE_PATH>\temp`      |
+| `APPS_RESOURCE_PATH`   | `<APPS_BASE_PATH>\resources` |
+| `START_DOCKER`         | `false`                      |
+| `DOCKER_WAIT_TIMEOUT`  | `90` (segundos)              |
+| `HEALTH_CHECK_URL`     | (ninguno)                      |
+| `DEBUG_PORT`           | (ninguno)                      |
+| `EXTRA_JVM_ARGS`       | (ninguno)                      |
+| `SKIP_BUILD`           | `false`                      |
+| `TEST_DIR`             | (personalizado)                |
+| `DOCKER_COMPOSE_FILE`  | auto-detectado                 |
+| `DOCKER_WAIT_PORT`     | (ninguno)                      |
+| `DOCKER_HEALTH_URL`    | (ninguno)                      |
 
-`SKIP_BUILD` y `START_DOCKER` se editan como interruptores Boolean en la configuración de la app.
+### Editar desde la Interfaz
 
-Si no se indican, las rutas `APPS_*` se derivan solas a partir de `APPS_BASE_PATH`.
+1. Pulsa el botón **Configuración** (tune icon) para el proyecto activo
+2. El modal muestra todas las variables con su tipo y descripción
+3. Modifica los valores y pulsa **Guardar**
+4. Los cambios se escriben directamente en el fichero `.env`
 
-## Troubleshooting
-
-**La app no arranca:**
-
-- Revisa logs: `C:\apps_env\logs\<proyecto>\`
-- Logs de Tomcat: `<TOMCAT_HOME>\logs\catalina.out` / `catalina-<fecha>.log`
-- Verifica variables de BD en el registro
-
-**Puerto en uso:**
+### Editar desde PowerShell
 
 ```powershell
-netstat -ano | findstr :8080
-Stop-Process -Id <PID> -Force
+# Ver config actual
+Get-Content resources\mi-proyecto\.env
+
+# Añadir/modificar variable
+Set-Content resources\mi-proyecto\.env -Value @(
+    "PROJECT_DIR=C:\Git\mi_app",
+    "WAR_MODULE_DIR=mi_app-war",
+    "CONTEXT_PATH=mi_app",
+    "TOMCAT_HOME=C:\Program Files\Apache Software Foundation\Tomcat 9.0",
+    "JAVA_HOME=C:\Program Files\Java\jdk-11.0.21",
+    "TOMCAT_PORT=8080",
+    "START_DOCKER=true",
+    "DOCKER_COMPOSE_FILE=resources\mi-proyecto\docker\docker-compose.yml"
+)
 ```
+
+---
+
+## Soporte Docker
+
+La aplicación soporta el arranque de servicios Docker antes de iniciar Tomcat.
+
+### Configuración
+
+1. Al crear un proyecto, marca **"Requiere servicios Docker"**
+2. Indica la ruta del fichero `docker-compose.yml` (o deja vacío para auto-detectar)
+3. Opcional: Puerto a esperar (`DOCKER_WAIT_PORT`) y URL de salud (`DOCKER_HEALTH_URL`)
+
+### Auto-detección
+
+Si no se indica la ruta, la búsqueda sigue este orden:
+
+1. `resources\<proyecto>\docker\docker-compose.yml / compose.yml`
+2. `resources\<proyecto>\docker-compose.yml / compose.yml`
+3. `<PROJECT_DIR>\docker\docker-compose.yml / compose.yml`
+4. `<PROJECT_DIR>\docker-compose.yml / compose.yml`
+
+### Variables Docker en el .env
+
+| Variable                | Descripción                                              |
+| ----------------------- | --------------------------------------------------------- |
+| `START_DOCKER`        | `true` para activar (bool)                              |
+| `DOCKER_COMPOSE_FILE` | Ruta al fichero compose                                   |
+| `DOCKER_WAIT_PORT`    | Puerto que debe estar escuchando antes de arrancar Tomcat |
+| `DOCKER_HEALTH_URL`   | URL que debe devolver 200/302 para considerarse lista     |
+| `DOCKER_WAIT_TIMEOUT` | Segundos de espera máximo (default: 90)                  |
+
+### Detener Servicios Docker
+
+Al ejecutar `stop-app.ps1`, los contenedores Docker definidos en el `.env` se detienen automáticamente si `START_DOCKER=true`.
+
+---
+
+## Explorador de Pruebas
+
+La aplicación incluye un explorador de tests integrado que:
+
+1. **Descubre tests**: Escanea directorios `src/test/java` y ficheros `surefire-reports`
+2. **Muestra resultados**: Visualiza clases y métodos con su estado (pass/fail/skip)
+3. **Ejecución**: Ejecuta tests seleccionados o todos mediante Maven
+4. **Modo master**: Checkbox "Seleccionar todo" para marcar/deseleccionar todos
+
+### Uso
+
+1. Pulsa el botón **Explorador de pruebas** ( flask icon)
+2. El árbol muestra clases y métodos disponibles
+3. Marca las casillas para seleccionar tests específicos
+4. Pulsa **Ejecutar seleccionados** o **Ejecutar todo**
+5. Los resultados se actualizan en tiempo real en la consola
+
+### Desde PowerShell
+
+```powershell
+# Descubrir tests
+.\scripts\start-app.ps1 mi-proyecto --discover-tests
+
+# Ejecutar todos
+mvn test -f pom.xml -DfailIfNoTests=false
+
+# Ejecutar tests específicos
+mvn test -Dtest=ClaseTest,# metodo1,# metodo2 -DfailIfNoTests=false
+```
+
+---
+
+## Despliegue desde PowerShell
+
+Los scripts `scripts/start-app.ps1` y `scripts/stop-app.ps1` se pueden ejecutar directamente desde PowerShell para uso sin la interfaz gráfica.
+
+### start-app.ps1
+
+```powershell
+# Uso básico
+.\scripts\start-app.ps1 mi-proyecto
+
+# Con puerto de depuración
+.\scripts\start-app.ps1 mi-proyecto 8000 y
+
+# Variables de entorno opcionales (heredadas por el script)
+# APPS_BASE_PATH, APPS_ENV, etc. vienen del .env del proyecto
+```
+
+### stop-app.ps1
+
+```powershell
+.\scripts\stop-app.ps1 mi-proyecto
+```
+
+### Build Script
+
+```powershell
+# Compilar el paquete de distribución
+.\scripts\build.ps1
+```
+
+---
+
+## Solución de Problemas
+
+### La app no arranca
+
+1. **Revisa los logs**:
+
+   - Consola inferior de la aplicación
+   - `C:\apps_env\logs\<proyecto>\` (logs propios de la app)
+   - `<TOMCAT_HOME>\logs\catalina*.log` (logs de Tomcat)
+2. **Verifica variables obligatorias** en el `.env`:
+
+   - `PROJECT_DIR`, `WAR_MODULE_DIR`, `CONTEXT_PATH`, `TOMCAT_HOME`, `JAVA_HOME`
+3. **Puerto en uso**:
+
+   ```powershell
+   netstat -ano | findstr :8080
+   # Identifica el PID y deténlo: Stop-Process -Id <PID> -Force
+   ```
+4. **Errores de Maven**:
+
+   - Asegúrate de que `mvn` esté en PATH o usa `mvnw.cmd`
+   - Verifica variables `SKIP_BUILD=true` si ya tienes el WAR compilado
+
+### Puerto 8080 ocupado
+
+El launcher configura puertos por proyecto, pero si hay conflicto:
+
+```powershell
+# Verificar qué usa el puerto
+Get-NetTCPConnection -LocalPort 8080
+
+# Matar procesos Java que usen el nombre del proyecto
+Get-Process java | Where-Object {
+    $cmd -and $cmd -match "-Dtomcat\.name=mi-proyecto"
+} | Stop-Process -Force
+```
+
+### Error de compilación EBUSCrowdStrike
+
+Si usas CrowdStrike o antivirus que bloquea archivos, el script `build.ps1` usa `robocopy /MIR` que no requiere borrar el directorio destino. Ejecuta `.\scripts\build.ps1` para rebuild limpio.
+
+---
+
+## Estructura de Archivos
+
+```
+C:\apps_env\resources\          # Carpeta base seleccionada por el usuario
+│
+├── launcher\                   # Auto-contenido, listo para compartir
+│   ├── main.js / renderer.js / preload.js / index.html
+│   ├── scripts/
+│   │   ├── start-app.ps1     # Ciclo completo: build + config + deploy + arranque
+│   │   └── stop-app.ps1      # Parada generica (PowerShell)
+│   ├── docs/
+│   │   └── .env.ejemplo      # Template para nuevos proyectos
+│   └── ...
+│
+├── app_1/                      # Proyecto 1
+│   └── .env                    # Java 21 + Tomcat 10.1
+│
+├── app_2/                      # Proyecto 2
+│   └── .env                    # Java 11 + Tomcat 9.0
+│
+└── app_3/                      # Proyecto 3
+    └── .env                    # Java 11 + Tomcat 9.0
+```
+
+### Plantilla `.env.ejemplo`
+
+La plantilla se encuentra en `docs/.env.ejemplo` y contiene todos los comentarios y estructura base. Al crear un nuevo proyecto, la aplicación la copia y reemplaza los placeholders `<nombre_proyecto>` y `<NOMBRE>`.
+
+---
+
+## Tecnologías Utilizadas
+
+- **Electron** - Aplicación de escritorio
+- **TypeScript** - Código fuente
+- **Maven** - Build y gestión de dependencias
+- **PowerShell** - Scripts de arranque/parada de Tomcat
+- **Docker** - Servicios auxiliares (opcional)
+- **JUnit/TestNG** - Framework de tests
+
+---
+
+## Atribución
+
+Inspirado en el flujo de trabajo de **Eclipse WTP** (Web Tools Platform) con bases Tomcat aisladas por proyecto.
+
+Licencia: MIT
