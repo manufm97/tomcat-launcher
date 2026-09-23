@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
+const os = __importStar(require("os"));
 const electron_1 = require("electron");
 const child_process_1 = require("child_process");
 const SCRIPT_DIR = __dirname;
@@ -532,6 +533,7 @@ electron_1.ipcMain.on("log-close", () => stopModalTail());
 const CONFIG_CATALOG = {
     CONTEXT_PATH: { description: "Contexto de despliegue de la aplicación", kind: "string", required: true, common: true },
     PROJECT_DIR: { description: "Ruta del proyecto fuente", kind: "path", required: true, common: true },
+    PROJECT_DIR_FRONTEND: { description: "Ruta del proyecto frontend (opcional)", kind: "path", required: false, common: true },
     WAR_MODULE_DIR: { description: "Nombre del módulo WAR del proyecto", kind: "string", required: true, common: true },
     APPS_ENV: { description: "Entorno de despliegue", kind: "string", required: true, common: true },
     APPS_BASE_PATH: { description: "Ruta base para instalaciones de entornos", kind: "path", required: true, common: true },
@@ -615,6 +617,42 @@ electron_1.ipcMain.handle("save-config", (event, payload) => {
 electron_1.ipcMain.on("start", (event, name) => startProject(name));
 electron_1.ipcMain.on("debug", (event, name) => startDebug(name));
 electron_1.ipcMain.on("stop", (event, name) => stopProject(name));
+electron_1.ipcMain.on("open-vscode", (event, name) => openProjectInVsCode(name));
+function openProjectInVsCode(name) {
+    const env = parseEnv(name);
+    const dirs = [];
+    if (env.PROJECT_DIR)
+        dirs.push(env.PROJECT_DIR);
+    if (env.PROJECT_DIR_FRONTEND)
+        dirs.push(env.PROJECT_DIR_FRONTEND);
+    const existing = [...new Set(dirs.filter((d) => fs.existsSync(d)))];
+    if (existing.length === 0)
+        return;
+    if (existing.length === 1) {
+        try {
+            electron_1.shell.openExternal("vscode://file/" + existing[0].replace(/\\/g, "/"));
+        }
+        catch (e) { }
+        return;
+    }
+    try {
+        const wsPath = path.join(os.tmpdir(), "apps-env-launcher-" + name.replace(/[^\w.-]/g, "_") + ".code-workspace");
+        const ws = {
+            folders: existing.map((d) => ({ path: d.replace(/\\/g, "/") })),
+            settings: {},
+        };
+        fs.writeFileSync(wsPath, JSON.stringify(ws, null, 2), "utf8");
+        electron_1.shell.openExternal("vscode://file/" + wsPath.replace(/\\/g, "/"));
+    }
+    catch (e) {
+        for (const d of existing) {
+            try {
+                electron_1.shell.openExternal("vscode://file/" + d.replace(/\\/g, "/"));
+            }
+            catch (e2) { }
+        }
+    }
+}
 function startDebug(name) {
     if (!name)
         return;
@@ -643,11 +681,8 @@ function startDebug(name) {
             }
         }
         catch (e) { }
-        try {
-            electron_1.shell.openExternal("vscode://file/" + projectDir.replace(/\\/g, "/"));
-        }
-        catch (e) { }
     }
+    openProjectInVsCode(name);
     startProject(name, port);
 }
 function findJavaFiles(dir) {

@@ -13,6 +13,7 @@ electron_1.contextBridge.exposeInMainWorld("api", {
     start: (name) => electron_1.ipcRenderer.send("start", name),
     debug: (name) => electron_1.ipcRenderer.send("debug", name),
     stop: (name) => electron_1.ipcRenderer.send("stop", name),
+    openVscode: (name) => electron_1.ipcRenderer.send("open-vscode", name),
     openUrl: (url) => electron_1.ipcRenderer.send("open-url", url),
     openLog: (payload) => electron_1.ipcRenderer.send("log-open", payload),
     closeLog: () => electron_1.ipcRenderer.send("log-close"),

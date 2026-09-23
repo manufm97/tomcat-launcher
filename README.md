@@ -67,14 +67,14 @@ La aplicación muestra una lista de proyectos detectados en la carpeta base. Cad
 | Botón                          | Atajo            | Descripción                                                 |
 | ------------------------------- | ---------------- | ------------------------------------------------------------ |
 | **Iniciar**               | `Ctrl+R`       | Arranca el proyecto seleccionado en Tomcat                   |
-| **Depurar**               | `Ctrl+D`       | Arranca con depuración JDWP (VS Code attach)                |
+| **Depurar**               | `Ctrl+D`       | Arranca con depuración JDWP (VS Code attach; abre backend y frontend si `PROJECT_DIR_FRONTEND` está definido) |
 | **Detener**               | `Ctrl+S`       | Detiene el Tomcat en ejecución                              |
 | **Abrir en navegador**    | `Ctrl+L`       | Abre la URL de la aplicación en el navegador predeterminado |
 | **Explorador de pruebas** | `Ctrl+T`       | Abre el analizador de tests JUnit/TestNG                     |
 | **Limpiar consola**       | `Ctrl+K`       | Borra la consola inferior                                    |
 | **Ver logs**              | `Ctrl+Shift+L` | Abre el visor de logs de Tomcat                              |
 | **Configuración**        | `Ctrl+Shift+C` | Edita el fichero`.env` del proyecto                        |
-| **Abrir en VS Code**      | `Ctrl+Shift+V` | Abre el proyecto en VS Code                                  |
+| **Abrir en VS Code**      | `Ctrl+Shift+V` | Abre el proyecto en VS Code (backend y frontend si `PROJECT_DIR_FRONTEND` está definido) |
 | **Ruta base**             | `Ctrl+Shift+P` | Cambia la carpeta base de proyectos                          |
 | **Añadir proyecto**      | `Ctrl+Shift+N` | Crea un nuevo proyecto desde la plantilla                    |
 
@@ -162,6 +162,7 @@ Las passwords **no** van en el `.env`. Se leen del registro mediante `*_REGVAR`:
 | `DOCKER_WAIT_TIMEOUT`  | `90` (segundos)              |
 | `HEALTH_CHECK_URL`     | (ninguno)                      |
 | `DEBUG_PORT`           | (ninguno)                      |
+| `PROJECT_DIR_FRONTEND` | (ninguno)                      |
 | `EXTRA_JVM_ARGS`       | (ninguno)                      |
 | `SKIP_BUILD`           | `false`                      |
 | `TEST_DIR`             | (personalizado)                |

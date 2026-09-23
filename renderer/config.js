@@ -219,6 +219,23 @@ function renderDockerSection(docker) {
     section.appendChild(body);
     return section;
 }
+function ensureFrontendEntry() {
+    const existing = configEntries.find((e) => e.type === "kv" && e.key === "PROJECT_DIR_FRONTEND");
+    if (existing) {
+        if (!existing.description)
+            existing.description = "Ruta del proyecto frontend (opcional)";
+        return;
+    }
+    configEntries.push({
+        type: "kv",
+        key: "PROJECT_DIR_FRONTEND",
+        value: "",
+        kind: "path",
+        required: false,
+        common: true,
+        description: "Ruta del proyecto frontend (opcional)",
+    });
+}
 function renderConfigRows() {
     configRows.innerHTML = '<p class="cfg-hint">Edita las variables. Los comentarios se conservan al guardar.</p>';
     const common = [];
@@ -265,6 +282,7 @@ async function openConfigModal() {
     const info = await window.api.getConfig(configName);
     configEntries = info.entries || [];
     ensureDockerEntries();
+    ensureFrontendEntry();
     renderConfigRows();
     configModal.classList.remove("hidden");
 }
@@ -341,7 +359,9 @@ configModal.addEventListener("click", (e) => {
         closeConfigModal();
 });
 document.getElementById("configSave").addEventListener("click", async () => {
-    const entries = configEntries.filter((e) => e.type !== "kv" || e.group !== "docker" || (e.value || "").trim() !== "");
+    const entries = configEntries.filter((e) => e.type !== "kv" ||
+        (e.group !== "docker" && e.key !== "PROJECT_DIR_FRONTEND") ||
+        (e.value || "").trim() !== "");
     await window.api.saveConfig({ name: configName, entries });
     closeConfigModal();
 });

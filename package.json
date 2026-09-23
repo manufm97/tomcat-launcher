@@ -1,6 +1,6 @@
 {
   "name": "apps-env-launcher",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Launcher Electron para arrancar proyectos Tomcat (scripts/start-app.ps1) con consola integrada.",
   "main": "main.js",
   "author": "",

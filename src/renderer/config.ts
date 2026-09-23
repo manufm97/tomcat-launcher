@@ -268,6 +268,23 @@ function renderDockerSection(docker: ConfigEntry[]): HTMLElement {
   return section;
 }
 
+function ensureFrontendEntry(): void {
+  const existing = configEntries.find((e) => e.type === "kv" && e.key === "PROJECT_DIR_FRONTEND");
+  if (existing) {
+    if (!existing.description) existing.description = "Ruta del proyecto frontend (opcional)";
+    return;
+  }
+  configEntries.push({
+    type: "kv",
+    key: "PROJECT_DIR_FRONTEND",
+    value: "",
+    kind: "path",
+    required: false,
+    common: true,
+    description: "Ruta del proyecto frontend (opcional)",
+  });
+}
+
 function renderConfigRows(): void {
   configRows.innerHTML = '<p class="cfg-hint">Edita las variables. Los comentarios se conservan al guardar.</p>';
 
@@ -315,6 +332,7 @@ async function openConfigModal(): Promise<void> {
   const info = await window.api.getConfig(configName);
   configEntries = info.entries || [];
   ensureDockerEntries();
+  ensureFrontendEntry();
   renderConfigRows();
   configModal.classList.remove("hidden");
 }
@@ -399,8 +417,12 @@ configModal.addEventListener("click", (e: MouseEvent) => {
 document.getElementById("configSave")!.addEventListener("click", async () => {
   // Las variables Docker vacias no se escriben: asi el .env queda limpio y
   // sigue funcionando la deteccion automatica de la carpeta docker/.
+  // PROJECT_DIR_FRONTEND vacio tampoco se escribe (proyecto sin frontend).
   const entries = configEntries.filter(
-    (e) => e.type !== "kv" || e.group !== "docker" || (e.value || "").trim() !== ""
+    (e) =>
+      e.type !== "kv" ||
+      (e.group !== "docker" && e.key !== "PROJECT_DIR_FRONTEND") ||
+      (e.value || "").trim() !== ""
   );
   await window.api.saveConfig({ name: configName, entries });
   closeConfigModal();

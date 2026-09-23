@@ -1,5 +1,6 @@
 import * as path from "path";
 import * as fs from "fs";
+import * as os from "os";
 import { app, BrowserWindow, ipcMain, Menu, shell, dialog } from "electron";
 import { spawn, execSync } from "child_process";
 
@@ -562,6 +563,7 @@ interface ConfigMeta {
 const CONFIG_CATALOG: Record<string, ConfigMeta> = {
   CONTEXT_PATH: { description: "Contexto de despliegue de la aplicación", kind: "string", required: true, common: true },
   PROJECT_DIR: { description: "Ruta del proyecto fuente", kind: "path", required: true, common: true },
+  PROJECT_DIR_FRONTEND: { description: "Ruta del proyecto frontend (opcional)", kind: "path", required: false, common: true },
   WAR_MODULE_DIR: { description: "Nombre del módulo WAR del proyecto", kind: "string", required: true, common: true },
   APPS_ENV: { description: "Entorno de despliegue", kind: "string", required: true, common: true },
   APPS_BASE_PATH: { description: "Ruta base para instalaciones de entornos", kind: "path", required: true, common: true },
@@ -658,6 +660,37 @@ ipcMain.handle("save-config", (event, payload) => {
 ipcMain.on("start", (event, name: string) => startProject(name));
 ipcMain.on("debug", (event, name: string) => startDebug(name));
 ipcMain.on("stop", (event, name: string) => stopProject(name));
+ipcMain.on("open-vscode", (event, name: string) => openProjectInVsCode(name));
+
+// Abre en VS Code las carpetas del proyecto: backend (PROJECT_DIR) y, si
+// existe, frontend (PROJECT_DIR_FRONTEND). Con las dos se genera un
+// workspace multi-root temporal para que ambas aparezcan en la misma ventana.
+function openProjectInVsCode(name: string): void {
+  const env = parseEnv(name);
+  const dirs: string[] = [];
+  if (env.PROJECT_DIR) dirs.push(env.PROJECT_DIR);
+  if (env.PROJECT_DIR_FRONTEND) dirs.push(env.PROJECT_DIR_FRONTEND);
+  const existing = [...new Set(dirs.filter((d) => fs.existsSync(d)))];
+  if (existing.length === 0) return;
+
+  if (existing.length === 1) {
+    try { shell.openExternal("vscode://file/" + existing[0].replace(/\\/g, "/")); } catch (e) {}
+    return;
+  }
+  try {
+    const wsPath = path.join(os.tmpdir(), "apps-env-launcher-" + name.replace(/[^\w.-]/g, "_") + ".code-workspace");
+    const ws = {
+      folders: existing.map((d) => ({ path: d.replace(/\\/g, "/") })),
+      settings: {},
+    };
+    fs.writeFileSync(wsPath, JSON.stringify(ws, null, 2), "utf8");
+    shell.openExternal("vscode://file/" + wsPath.replace(/\\/g, "/"));
+  } catch (e) {
+    for (const d of existing) {
+      try { shell.openExternal("vscode://file/" + d.replace(/\\/g, "/")); } catch (e2) {}
+    }
+  }
+}
 
 function startDebug(name: string): void {
   if (!name) return;
@@ -685,10 +718,8 @@ function startDebug(name: string): void {
         fs.writeFileSync(launchPath, JSON.stringify(cfg, null, 2), "utf8");
       }
     } catch (e) {}
-    try {
-      shell.openExternal("vscode://file/" + projectDir.replace(/\\/g, "/"));
-    } catch (e) {}
   }
+  openProjectInVsCode(name);
   startProject(name, port);
 }
 

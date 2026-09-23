@@ -17,7 +17,6 @@ const testsBtn     = document.getElementById("testsBtn") as HTMLButtonElement;
 
 let currentUrl      = "";
 let currentProjDir  = "";
-let currentVscodeUri= "";
 let isRunning       = false;
 let currentRaw      = "";
 let currentDiv: HTMLDivElement | null = null;

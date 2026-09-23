@@ -28,6 +28,7 @@ interface Api {
   start(name: string): void;
   debug(name: string): void;
   stop(name: string): void;
+  openVscode(name: string): void;
   openUrl(url: string): void;
   openLog(payload: { name: string; loc: string; file: string }): void;
   closeLog(): void;

@@ -15,7 +15,6 @@ async function updateLink() {
         testsBtn.disabled = true;
         debugBtn.disabled = true;
         startBtn.disabled = true;
-        currentVscodeUri = "";
         return;
     }
     const info = await window.api.getAppUrl(name);
@@ -28,7 +27,6 @@ async function updateLink() {
         projDir.title = "Abrir carpeta: " + currentProjDir;
         projDir.href = currentProjDir;
         projDir.classList.remove("disabled");
-        currentVscodeUri = "vscode://file/" + currentProjDir.replace(/\\/g, "/");
         vscodeBtn.disabled = false;
         logsBtn.disabled = false;
         cfgBtn.disabled = false;
@@ -44,7 +42,6 @@ async function updateLink() {
         logsBtn.disabled = true;
         cfgBtn.disabled = true;
         testsBtn.disabled = true;
-        currentVscodeUri = "";
     }
     applyRunning(isRunning);
 }
@@ -58,8 +55,9 @@ projDir.addEventListener("click", (e) => {
         window.api.openUrl(currentProjDir);
 });
 vscodeBtn.addEventListener("click", () => {
-    if (currentVscodeUri)
-        window.api.openUrl(currentVscodeUri);
+    const name = select.value;
+    if (name && !vscodeBtn.disabled)
+        window.api.openVscode(name);
 });
 select.addEventListener("change", updateLink);
 function applyRunning(state) {

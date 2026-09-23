@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld("api", {
   start: (name: string) => ipcRenderer.send("start", name),
   debug: (name: string) => ipcRenderer.send("debug", name),
   stop: (name: string) => ipcRenderer.send("stop", name),
+  openVscode: (name: string) => ipcRenderer.send("open-vscode", name),
   openUrl: (url: string) => ipcRenderer.send("open-url", url),
   openLog: (payload: any) => ipcRenderer.send("log-open", payload),
   closeLog: () => ipcRenderer.send("log-close"),

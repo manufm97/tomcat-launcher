@@ -56,7 +56,7 @@ if (-not $projectName) {
 # sin esta limpieza un proyecto heredaria variables del proyecto anterior.
 $varsToClear = @(
     "PROJECT_NAME", "APP_CODE", "ARTIFACT_TYPE", "ARTIFACT_NAME", "WAR_MODULE_DIR",
-    "PROJECT_DIR", "WAR_DIR", "CONTEXT_PATH", "APPS_ENV", "APPS_BASE_PATH",
+    "PROJECT_DIR", "PROJECT_DIR_FRONTEND", "WAR_DIR", "CONTEXT_PATH", "APPS_ENV", "APPS_BASE_PATH",
     "APPS_CONFIG_PATH", "APPS_LOG_PATH", "APPS_CERT_PATH", "APPS_DATA_PATH",
     "APPS_TEMP_PATH", "APPS_RESOURCE_PATH", "APP_SERVER", "TOMCAT_VERSION",
     "SERVER_HOME", "TOMCAT_HOME", "TOMCAT_PORT", "TOMCAT_SHUTDOWN_PORT", "DEBUG_PORT",
@@ -403,63 +403,107 @@ if ($dockerComposeFile) {
         Write-Host "WARN: hay compose pero Docker no esta en el PATH. Se arranca Tomcat sin estos servicios." -ForegroundColor Yellow
         $dockerSummary = "Docker no disponible"
     } else {
-        & docker compose version 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            & docker compose -f $dockerComposeFile up -d
-            $composeExit = $LASTEXITCODE
+        # --- Verificar si el daemon Docker esta respondiendo ---
+        $dockerReady = $false
+        try {
+            & docker info 2>&1 | Out-Null
+            $dockerReady = $LASTEXITCODE -eq 0
+        } catch {
+            $dockerReady = $false
+        }
+
+        if (-not $dockerReady) {
+            Write-Host "Daemon Docker no responde. Intentando arrancar Docker Desktop..." -ForegroundColor Yellow
+
+            $dockerDesktopPaths = @(
+                "C:\Program Files\Docker\Docker\Docker Desktop.exe",
+                "$env:LOCALAPPDATA\Docker\Docker\Docker Desktop.exe"
+            )
+            $dockerExePath = $dockerDesktopPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+            if ($dockerExePath) {
+                Start-Process -FilePath $dockerExePath -WindowStyle Minimized
+                $dockerStartupTimeout = 120
+                $dockerDeadline = (Get-Date).AddSeconds($dockerStartupTimeout)
+                Write-Host "Esperando a que Docker Desktop arranque (hasta ${dockerStartupTimeout}s)..."
+                while ((Get-Date) -lt $dockerDeadline) {
+                    Start-Sleep -Seconds 5
+                    try {
+                        & docker info 2>&1 | Out-Null
+                        if ($LASTEXITCODE -eq 0) { $dockerReady = $true; break }
+                    } catch {}
+                }
+                if ($dockerReady) {
+                    Write-Host "Docker Desktop arrancado" -ForegroundColor Green
+                } else {
+                    Write-Host "WARN: Docker Desktop no responde tras ${dockerStartupTimeout}s. Se continua sin Docker." -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "WARN: Docker Desktop no encontrado. Se continua sin Docker." -ForegroundColor Yellow
+            }
+        }
+
+        if (-not $dockerReady) {
+            $dockerSummary = "Docker no disponible"
         } else {
-            $composeExe = Get-Command docker-compose -ErrorAction SilentlyContinue
-            if ($composeExe) {
-                & docker-compose -f $dockerComposeFile up -d
+            & docker compose version 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                & docker compose -f $dockerComposeFile up -d
                 $composeExit = $LASTEXITCODE
             } else {
-                Write-Host "WARN: Docker sin 'docker compose' ni 'docker-compose'. Se arranca Tomcat sin estos servicios." -ForegroundColor Yellow
-                $dockerSummary = "compose no disponible"
-                $composeExit = -1
-            }
-        }
-
-        if ($composeExit -ne 0) {
-            Write-Host "WARN: docker compose devolvio $composeExit. La app puede fallar si depende de estos servicios." -ForegroundColor Yellow
-            if ($dockerSummary -eq "sin compose") { $dockerSummary = "error al arrancar" }
-        } else {
-            Write-Host "Servicios Docker arrancados" -ForegroundColor Green
-            $dockerSummary = "arrancado"
-        }
-
-        # --- Esperar a que los servicios respondan (opcional) ---
-        $dockerWaitPort = 0
-        if ($env:DOCKER_WAIT_PORT) { [int]::TryParse($env:DOCKER_WAIT_PORT, [ref]$dockerWaitPort) | Out-Null }
-        $dockerTimeout = if ($env:DOCKER_WAIT_TIMEOUT) { [int]$env:DOCKER_WAIT_TIMEOUT } else { 90 }
-
-        if ($composeExit -eq 0 -and ($dockerWaitPort -gt 0 -or $env:DOCKER_HEALTH_URL)) {
-            Write-Host "Esperando servicios Docker (hasta $dockerTimeout s)..."
-            $dockerDeadline = (Get-Date).AddSeconds($dockerTimeout)
-            $dockerUp = $false
-            while ((Get-Date) -lt $dockerDeadline) {
-                $portOk = $true
-                if ($dockerWaitPort -gt 0) {
-                    $portOk = $null -ne (Get-NetTCPConnection -LocalPort $dockerWaitPort -State Listen -ErrorAction SilentlyContinue)
+                $composeExe = Get-Command docker-compose -ErrorAction SilentlyContinue
+                if ($composeExe) {
+                    & docker-compose -f $dockerComposeFile up -d
+                    $composeExit = $LASTEXITCODE
+                } else {
+                    Write-Host "WARN: Docker sin 'docker compose' ni 'docker-compose'. Se arranca Tomcat sin estos servicios." -ForegroundColor Yellow
+                    $dockerSummary = "compose no disponible"
+                    $composeExit = -1
                 }
-                $urlOk = $true
-                if ($env:DOCKER_HEALTH_URL) {
-                    $urlOk = $false
-                    try {
-                        $dresp = Invoke-WebRequest -Uri $env:DOCKER_HEALTH_URL -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-                        $urlOk = ([int]$dresp.StatusCode -eq 200)
-                    } catch {
-                        $urlOk = $false
-                    }
-                }
-                if ($portOk -and $urlOk) { $dockerUp = $true; break }
-                Start-Sleep -Seconds 2
             }
-            if ($dockerUp) {
-                Write-Host "Servicios Docker listos" -ForegroundColor Green
-                $dockerSummary = "listo"
+
+            if ($composeExit -ne 0) {
+                Write-Host "WARN: docker compose devolvio $composeExit. La app puede fallar si depende de estos servicios." -ForegroundColor Yellow
+                if ($dockerSummary -eq "sin compose") { $dockerSummary = "error al arrancar" }
             } else {
-                Write-Host "WARN: los servicios Docker no responden tras $dockerTimeout s." -ForegroundColor Yellow
-                $dockerSummary = "sin respuesta"
+                Write-Host "Servicios Docker arrancados" -ForegroundColor Green
+                $dockerSummary = "arrancado"
+            }
+
+            # --- Esperar a que los servicios respondan (opcional) ---
+            $dockerWaitPort = 0
+            if ($env:DOCKER_WAIT_PORT) { [int]::TryParse($env:DOCKER_WAIT_PORT, [ref]$dockerWaitPort) | Out-Null }
+            $dockerTimeout = if ($env:DOCKER_WAIT_TIMEOUT) { [int]$env:DOCKER_WAIT_TIMEOUT } else { 90 }
+
+            if ($composeExit -eq 0 -and ($dockerWaitPort -gt 0 -or $env:DOCKER_HEALTH_URL)) {
+                Write-Host "Esperando servicios Docker (hasta $dockerTimeout s)..."
+                $dockerDeadline = (Get-Date).AddSeconds($dockerTimeout)
+                $dockerUp = $false
+                while ((Get-Date) -lt $dockerDeadline) {
+                    $portOk = $true
+                    if ($dockerWaitPort -gt 0) {
+                        $portOk = $null -ne (Get-NetTCPConnection -LocalPort $dockerWaitPort -State Listen -ErrorAction SilentlyContinue)
+                    }
+                    $urlOk = $true
+                    if ($env:DOCKER_HEALTH_URL) {
+                        $urlOk = $false
+                        try {
+                            $dresp = Invoke-WebRequest -Uri $env:DOCKER_HEALTH_URL -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                            $urlOk = ([int]$dresp.StatusCode -eq 200)
+                        } catch {
+                            $urlOk = $false
+                        }
+                    }
+                    if ($portOk -and $urlOk) { $dockerUp = $true; break }
+                    Start-Sleep -Seconds 2
+                }
+                if ($dockerUp) {
+                    Write-Host "Servicios Docker listos" -ForegroundColor Green
+                    $dockerSummary = "listo"
+                } else {
+                    Write-Host "WARN: los servicios Docker no responden tras $dockerTimeout s." -ForegroundColor Yellow
+                    $dockerSummary = "sin respuesta"
+                }
             }
         }
     }

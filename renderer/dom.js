@@ -13,7 +13,6 @@ const cfgBtn = document.getElementById("cfgBtn");
 const testsBtn = document.getElementById("testsBtn");
 let currentUrl = "";
 let currentProjDir = "";
-let currentVscodeUri = "";
 let isRunning = false;
 let currentRaw = "";
 let currentDiv = null;
