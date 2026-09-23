@@ -35,7 +35,6 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
-const os = __importStar(require("os"));
 const electron_1 = require("electron");
 const child_process_1 = require("child_process");
 const SCRIPT_DIR = __dirname;
@@ -626,31 +625,19 @@ function openProjectInVsCode(name) {
     if (env.PROJECT_DIR_FRONTEND)
         dirs.push(env.PROJECT_DIR_FRONTEND);
     const existing = [...new Set(dirs.filter((d) => fs.existsSync(d)))];
-    if (existing.length === 0)
-        return;
-    if (existing.length === 1) {
-        try {
-            electron_1.shell.openExternal("vscode://file/" + existing[0].replace(/\\/g, "/"));
-        }
-        catch (e) { }
-        return;
-    }
+    for (const d of existing)
+        openDirInVsCode(d);
+}
+function openDirInVsCode(dir) {
+    const uri = "vscode://file/" + dir.replace(/\\/g, "/");
     try {
-        const wsPath = path.join(os.tmpdir(), "apps-env-launcher-" + name.replace(/[^\w.-]/g, "_") + ".code-workspace");
-        const ws = {
-            folders: existing.map((d) => ({ path: d.replace(/\\/g, "/") })),
-            settings: {},
-        };
-        fs.writeFileSync(wsPath, JSON.stringify(ws, null, 2), "utf8");
-        electron_1.shell.openExternal("vscode://file/" + wsPath.replace(/\\/g, "/"));
+        (0, child_process_1.execSync)('code --new-window "' + dir.replace(/"/g, "") + '"', { windowsHide: true, stdio: "ignore" });
     }
     catch (e) {
-        for (const d of existing) {
-            try {
-                electron_1.shell.openExternal("vscode://file/" + d.replace(/\\/g, "/"));
-            }
-            catch (e2) { }
+        try {
+            electron_1.shell.openExternal(uri);
         }
+        catch (e2) { }
     }
 }
 function startDebug(name) {
