@@ -44,4 +44,5 @@ electron_1.contextBridge.exposeInMainWorld("api", {
         }
     }),
     onSettingsUpdated: (cb) => electron_1.ipcRenderer.on("settings-updated", () => cb()),
+    onShortcut: (cb) => electron_1.ipcRenderer.on("shortcut", (_e, action) => cb(action)),
 });

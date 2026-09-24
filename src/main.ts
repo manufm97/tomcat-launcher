@@ -1,7 +1,7 @@
 import * as path from "path";
 import * as fs from "fs";
 import { app, BrowserWindow, ipcMain, Menu, shell, dialog } from "electron";
-import { spawn, execSync } from "child_process";
+import { spawn, exec, execSync } from "child_process";
 
 // La ubicacion de los scripts es la propia carpeta del launcher (auto contenida).
 const SCRIPT_DIR = __dirname;
@@ -18,6 +18,20 @@ let startedProject: string | null = null; // proyecto que arranco esta app (para
 let modalTail: NodeJS.Timeout | null = null;     // tail del modal de logs
 let testProc: ReturnType<typeof spawn> | null = null; // proceso actual de tests
 let RESOURCES_PATH: string | null = null; // ruta base de proyectos elegida (persistente)
+
+const SHORTCUTS: Record<string, string> = {
+  "ctrl+r": "start",
+  "ctrl+d": "debug",
+  "ctrl+s": "stop",
+  "ctrl+l": "open-url",
+  "ctrl+t": "tests",
+  "ctrl+k": "clear",
+  "ctrl+shift+l": "logs",
+  "ctrl+shift+c": "config",
+  "ctrl+shift+v": "vscode",
+  "ctrl+shift+p": "base-path",
+  "ctrl+shift+n": "add-project",
+};
 
 // ---------- Persistencia de ruta base ----------
 function readResourcesPath(): string | null {
@@ -310,6 +324,18 @@ function createWindow(): void {
   // Ocultar el menu por defecto (File / Edit / View / ...) de Electron.
   Menu.setApplicationMenu(null);
 
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown" || input.isAutoRepeat) return;
+    if (!input.control || input.alt || input.meta) return;
+    const combo = (input.shift ? "ctrl+shift+" : "ctrl+") + input.key.toLowerCase();
+    const action = SHORTCUTS[combo];
+    if (!action) return;
+    event.preventDefault();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("shortcut", action);
+    }
+  });
+
   // Notifica al renderer cuando cambia el estado de maximizado, para
   // alternar el icono de maximizar/restaurar (estilo Windows).
   mainWindow.on("maximize", () => {
@@ -397,7 +423,7 @@ ipcMain.handle("add-project", (event, payload) => {
 });
 
 // Escanea directorios comunes buscando instalaciones de Java.
-ipcMain.handle("scan-java", () => {
+ipcMain.handle("scan-java", async () => {
   const bases = [
     "C:\\Program Files\\Java",
     "C:\\Program Files\\Eclipse Adoptium",
@@ -412,12 +438,11 @@ ipcMain.handle("scan-java", () => {
   for (const base of bases) {
     if (!fs.existsSync(base)) continue;
     try {
-      const dirs = fs.readdirSync(base, { withFileTypes: true });
+      const dirs = await fs.promises.readdir(base, { withFileTypes: true });
       for (const d of dirs) {
         if (d.isDirectory()) {
           const full = path.join(base, d.name);
-          const javaExe = path.join(full, "bin", "java.exe");
-          const hasJava = fs.existsSync(javaExe);
+          const hasJava = await fs.promises.access(path.join(full, "bin", "java.exe")).then(() => true, () => false);
           results.push({ name: d.name, path: full, hasJava });
         }
       }
@@ -429,12 +454,12 @@ ipcMain.handle("scan-java", () => {
 });
 
 // Escanea directorios comunes buscando instalaciones de Tomcat.
-ipcMain.handle("scan-tomcat", () => {
+ipcMain.handle("scan-tomcat", async () => {
   const base = "C:\\Program Files\\Apache Software Foundation";
   const results: { name: string; path: string }[] = [];
   if (!fs.existsSync(base)) return results;
   try {
-    const dirs = fs.readdirSync(base, { withFileTypes: true });
+    const dirs = await fs.promises.readdir(base, { withFileTypes: true });
     for (const d of dirs) {
       if (d.isDirectory() && d.name.toLowerCase().startsWith("tomcat")) {
         const full = path.join(base, d.name);
@@ -676,11 +701,11 @@ function openProjectInVsCode(name: string): void {
 
 function openDirInVsCode(dir: string): void {
   const uri = "vscode://file/" + dir.replace(/\\/g, "/");
-  try {
-    execSync('code --new-window "' + dir.replace(/"/g, "") + '"', { windowsHide: true, stdio: "ignore" });
-  } catch (e) {
-    try { shell.openExternal(uri); } catch (e2) {}
-  }
+  exec('code --new-window "' + dir.replace(/"/g, "") + '"', { windowsHide: true }, (err) => {
+    if (err) {
+      try { shell.openExternal(uri); } catch (e) {}
+    }
+  });
 }
 
 function startDebug(name: string): void {

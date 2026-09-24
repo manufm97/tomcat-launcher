@@ -43,6 +43,7 @@ interface Api {
   onLogChunk(cb: (text: string) => void): void;
   onWindowMaximized(cb: (maximized: boolean) => void): void;
   onSettingsUpdated(cb: () => void): void;
+  onShortcut(cb: (action: string) => void): void;
 }
 
 interface ConfigEntry {

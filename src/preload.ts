@@ -38,4 +38,5 @@ contextBridge.exposeInMainWorld("api", {
     try { cb(JSON.parse(text as string)); } catch (e) { cb({ type: "error", error: String(text) }); }
   }),
   onSettingsUpdated: (cb: () => void) => ipcRenderer.on("settings-updated", () => cb()),
+  onShortcut: (cb: (action: string) => void) => ipcRenderer.on("shortcut", (_e, action) => cb(action)),
 });

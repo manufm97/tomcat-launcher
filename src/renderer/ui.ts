@@ -5,7 +5,7 @@ async function updateLink(): Promise<void> {
   const name = select.value;
   if (!name) {
     appBtn.disabled = true;
-    appBtn.title = "Abrir en navegador";
+    appBtn.title = "Abrir en navegador (Ctrl+L)";
     currentUrl = "";
     projDir.classList.add("disabled");
     setChipText(projDir, "Carpeta");

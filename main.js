@@ -49,6 +49,19 @@ let startedProject = null;
 let modalTail = null;
 let testProc = null;
 let RESOURCES_PATH = null;
+const SHORTCUTS = {
+    "ctrl+r": "start",
+    "ctrl+d": "debug",
+    "ctrl+s": "stop",
+    "ctrl+l": "open-url",
+    "ctrl+t": "tests",
+    "ctrl+k": "clear",
+    "ctrl+shift+l": "logs",
+    "ctrl+shift+c": "config",
+    "ctrl+shift+v": "vscode",
+    "ctrl+shift+p": "base-path",
+    "ctrl+shift+n": "add-project",
+};
 function readResourcesPath() {
     try {
         const data = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8"));
@@ -303,6 +316,20 @@ function createWindow() {
     });
     mainWindow.loadFile(path.join(__dirname, "index.html"));
     electron_1.Menu.setApplicationMenu(null);
+    mainWindow.webContents.on("before-input-event", (event, input) => {
+        if (input.type !== "keyDown" || input.isAutoRepeat)
+            return;
+        if (!input.control || input.alt || input.meta)
+            return;
+        const combo = (input.shift ? "ctrl+shift+" : "ctrl+") + input.key.toLowerCase();
+        const action = SHORTCUTS[combo];
+        if (!action)
+            return;
+        event.preventDefault();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send("shortcut", action);
+        }
+    });
     mainWindow.on("maximize", () => {
         if (mainWindow && !mainWindow.isDestroyed())
             mainWindow.webContents.send("window-maximized", true);
@@ -381,7 +408,7 @@ electron_1.ipcMain.handle("add-project", (event, payload) => {
     }
     return { ok: true, name: clean };
 });
-electron_1.ipcMain.handle("scan-java", () => {
+electron_1.ipcMain.handle("scan-java", async () => {
     const bases = [
         "C:\\Program Files\\Java",
         "C:\\Program Files\\Eclipse Adoptium",
@@ -397,12 +424,11 @@ electron_1.ipcMain.handle("scan-java", () => {
         if (!fs.existsSync(base))
             continue;
         try {
-            const dirs = fs.readdirSync(base, { withFileTypes: true });
+            const dirs = await fs.promises.readdir(base, { withFileTypes: true });
             for (const d of dirs) {
                 if (d.isDirectory()) {
                     const full = path.join(base, d.name);
-                    const javaExe = path.join(full, "bin", "java.exe");
-                    const hasJava = fs.existsSync(javaExe);
+                    const hasJava = await fs.promises.access(path.join(full, "bin", "java.exe")).then(() => true, () => false);
                     results.push({ name: d.name, path: full, hasJava });
                 }
             }
@@ -412,13 +438,13 @@ electron_1.ipcMain.handle("scan-java", () => {
     results.sort((a, b) => a.name.localeCompare(b.name));
     return results;
 });
-electron_1.ipcMain.handle("scan-tomcat", () => {
+electron_1.ipcMain.handle("scan-tomcat", async () => {
     const base = "C:\\Program Files\\Apache Software Foundation";
     const results = [];
     if (!fs.existsSync(base))
         return results;
     try {
-        const dirs = fs.readdirSync(base, { withFileTypes: true });
+        const dirs = await fs.promises.readdir(base, { withFileTypes: true });
         for (const d of dirs) {
             if (d.isDirectory() && d.name.toLowerCase().startsWith("tomcat")) {
                 const full = path.join(base, d.name);
@@ -630,15 +656,14 @@ function openProjectInVsCode(name) {
 }
 function openDirInVsCode(dir) {
     const uri = "vscode://file/" + dir.replace(/\\/g, "/");
-    try {
-        (0, child_process_1.execSync)('code --new-window "' + dir.replace(/"/g, "") + '"', { windowsHide: true, stdio: "ignore" });
-    }
-    catch (e) {
-        try {
-            electron_1.shell.openExternal(uri);
+    (0, child_process_1.exec)('code --new-window "' + dir.replace(/"/g, "") + '"', { windowsHide: true }, (err) => {
+        if (err) {
+            try {
+                electron_1.shell.openExternal(uri);
+            }
+            catch (e) { }
         }
-        catch (e2) { }
-    }
+    });
 }
 function startDebug(name) {
     if (!name)
